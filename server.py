@@ -80,8 +80,7 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                             out["autostart"] = autostart.enable(auto.get("interval_minutes", 30), m.home)
                         else:
                             out["autostart"] = autostart.disable()
-                    self._json({"ok": True, "settings": out,
-                                "autostart": autostart.status()})
+                    self._json({"ok": True, "settings": out, "agents": autostart.agents()})
                 elif u.path == "/api/action":
                     name = (payload.get("name") or "").strip()
                     if name == "maintain":
@@ -97,7 +96,13 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                             r = autostart.enable((m.cfg.get("maintenance") or {}).get("interval_minutes", 30), m.home)
                         else:
                             r = autostart.disable()
-                        self._json({"ok": True, "result": r})
+                        self._json({"ok": True, "result": r, "agents": autostart.agents()})
+                    elif name == "panel_on":
+                        self._json({"ok": True, "result": autostart.enable_ui(8790, m.home),
+                                    "agents": autostart.agents()})
+                    elif name == "panel_off":
+                        self._json({"ok": True, "result": autostart.disable_ui(),
+                                    "agents": autostart.agents()})
                     else:
                         self._json({"error": "unknown action: %s" % name}, 400)
                 else:
@@ -121,9 +126,12 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                     self._json(graph(m, qs))
                 elif u.path == "/api/stats":
                     st = m.stats()
-                    st["autostart"] = autostart.status()
+                    st["agents"] = autostart.agents()
+                    st["autostart"] = autostart.ui_status()
                     st["settings"] = m.settings()
                     self._json(st)
+                elif u.path == "/api/agents":
+                    self._json({"agents": autostart.agents()})
                 elif u.path == "/api/settings":
                     self._json(m.settings())
                 elif u.path == "/api/search":

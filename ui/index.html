@@ -561,10 +561,15 @@ function fillSettings(st){
   document.getElementById('s-xpaths').value = (ex.paths||[]).join('\n');
   document.getElementById('s-xkeywords').value = (ex.keywords||[]).join('\n');
   const last = mt.last_run ? new Date(mt.last_run*1000).toLocaleString('zh-CN') : '从未';
-  const as = st.autostart || {};
   const set = document.getElementById('s-status');
+  const agents = (st.agents || []).map(a => {
+    const state = a.label === 'MemoryPanel'
+      ? (a.alive ? `运行中 · <code>${a.url}</code>` : (a.loaded ? '启动中/端口占用' : '未启用'))
+      : (a.loaded ? `运行中 · 每 ${Math.round((a.interval_seconds||0)/60)} 分钟` : '未启用');
+    return `<br>· <b>${a.label}</b>（${a.name}）：${state}`;
+  }).join('');
   if (set) set.innerHTML = `记忆 <b>${st.total ?? '—'}</b> 条 · 关系 <b>${st.links ?? '—'}</b> 条 · ` +
-    `上次维护 <b>${last}</b><br>后台任务：<b>${as.enabled ? '运行中（每 ' + Math.round((as.interval_seconds||0)/60) + ' 分钟）' : '未启用'}</b>`;
+    `上次维护 <b>${last}</b><br>后台任务：${agents || '<br>· 未启用'}`;
 }
 
 async function openSettings(){

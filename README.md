@@ -199,8 +199,17 @@ mem serve --port 8787 --open # 实时版：读活库 + JSON API
 mem serve --open     # 打开后点 ⚙ 即可全部配置
 ```
 
-launchd 任务（由面板开关，不需要手敲命令）：
-`~/Library/LaunchAgents/com.memcore.maintain.plist` → 每 30 分钟 `mem maintain`。
+### 后台任务（命名规则：一眼能认出谁是谁）
+
+| 名称（LaunchAgent Label） | 作用 | 位置 |
+|---|---|---|
+| **MemoryPanel** | 常驻面板服务（图表 + 设置），端口 8790，占用时自动顺延 | `~/Library/LaunchAgents/MemoryPanel.plist` |
+| **MemoryMaintain** | 每 30 分钟入库/建边/GC/重建镜像，并 checkpoint WAL | `~/Library/LaunchAgents/MemoryMaintain.plist` |
+
+日志：`~/.dsh/memory/MemoryPanel.log`、`~/.dsh/memory/MemoryMaintain.log`。
+
+约定：**新增任何后台脚本/守护项，必须给可读名称（Label + 文件名同名），并在本表登记；不用的立刻删除**，
+不留 `com.xxx.yyy` 这类看不出用途的条目。
 
 ## 11. LoCoMo 基准（检索层）
 

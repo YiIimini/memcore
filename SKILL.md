@@ -82,3 +82,5 @@ mem serve --open     # 设置面板：LLM Key / 自动维护开关与间隔 / �
 3. 同主题更新优先 `mem update <ID>`，不要堆重复条目。
 4. 检索结果为空就放宽（去掉 project/kind、加大 budget），仍空则说明确实没记忆过。
 5. 用户偏好可视配置：凡是"配置/开关/密钥/排除项"，给页面入口，不给命令行作业。
+6. 后台常驻项（launchd / 守护脚本 / .app）必须给可读名称（Label 与 plist 文件名同名，如 `MemoryPanel`、
+   `MemoryMaintain`），登记到 README 的后台任务表；同一用途不留两份，不用了立即 `bootout` + 删 plist。

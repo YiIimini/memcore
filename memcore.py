@@ -402,7 +402,13 @@ class Memory:
         edges = self.relink(rebuild=False)
         g = self.gc(dry_run=False)
         self.export_markdown()
-        self.brief(budget_tokens=700)
+        brief = self.brief(budget_tokens=700)
+        try:
+            with open(os.path.join(self.home, "BRIEF.md"), "w", encoding="utf-8") as fh:
+                fh.write(brief)
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
         self.cfg.setdefault("maintenance", {})["last_run"] = now()
         try:
             with open(self.config_path, "w", encoding="utf-8") as fh:
