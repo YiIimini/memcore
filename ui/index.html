@@ -96,6 +96,15 @@
   .status{font-size:11.5px;color:var(--dim);margin-top:10px;line-height:1.7}
   .status b{color:var(--fg)}
   .readonly{background:#2a1a0e;border:1px solid #5a3a12;color:#fbbf24;padding:8px 10px;border-radius:8px;font-size:11.5px;margin-bottom:12px}
+  #bubble{position:fixed;max-width:340px;padding:10px 12px;border-radius:10px;background:#0b1220f2;
+    border:1px solid #2b3a52;box-shadow:0 12px 36px #000c;pointer-events:none;opacity:0;
+    transform:translateY(4px);transition:opacity .12s ease, transform .12s ease;z-index:8;font-size:12px}
+  #bubble.show{opacity:1;transform:none}
+  #bubble .bt{font-size:13px;font-weight:600;margin-bottom:3px;line-height:1.35}
+  #bubble .bm{font-size:10.5px;color:var(--dim);margin-bottom:6px}
+  #bubble .bp{color:#cbd5e1;line-height:1.5;white-space:pre-wrap;max-height:132px;overflow:hidden}
+  #bubble .bk{display:inline-block;margin-top:6px;padding:1px 6px;border-radius:999px;background:#16213a;
+    color:#93c5fd;font-size:10px;margin-right:4px}
   #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);opacity:0;
     background:#111827e6;border:1px solid var(--line);padding:7px 14px;border-radius:999px;font-size:12px;
     transition:.2s;pointer-events:none;z-index:9}
@@ -193,9 +202,11 @@
   </div>
 </div>
 
+<div id="bubble"></div>
 <div id="toast"></div>
 
 <script>
+window.onerror = (m, src, l, c, e) => { document.title = 'ERR ' + l + ':' + c + ' ' + m; };
 const EMBEDDED = __DATA__;
 const KIND_COLOR = {
   core:'#e8ecff', identity:'#f472b6', preference:'#a78bfa', decision:'#60a5fa', fact:'#34d399',
@@ -221,6 +232,9 @@ let showLabels = true;
 let showRetired = false;
 let query = '';
 let hovered = null, selected = null;
+let mouse = {x: 0, y: 0, inside: false};
+let dragging = null;
+let bubbleFor = null;
 let view = {x:0, y:0, k:1};
 let canvas, ctx, W=0, H=0, DPR=1;
 const RAIL = 272;
@@ -259,7 +273,9 @@ function build(){
   edges.forEach(e => { deg.set(e.source,(deg.get(e.source)||0)+1); deg.set(e.target,(deg.get(e.target)||0)+1); });
   nodes.forEach(n => {
     n.deg = deg.get(n.id) || 0;
-    n.r = n.id === CORE_ID ? 22 : (4 + Math.sqrt(n.deg)*1.9 + (n.salience||0)*4.2);
+    n.r = n.id === CORE_ID ? 22 : (2.4 + Math.sqrt(n.deg)*1.05 + (n.salience||0)*1.9);
+    n.rNow = n.r;
+    n.hover = 0;
     if (n.id === CORE_ID) { n.x = 0; n.y = 0; n.fixed = true; }
   });
   fillProjects();
@@ -309,12 +325,27 @@ function tick(){
     const fx = dx/d*f, fy = dy/d*f;
     e.a.vx += fx; e.a.vy += fy; e.b.vx -= fx; e.b.vy -= fy;
   });
+  // magnetism: the node under the cursor drifts a little toward it
+  if (hovered && hovered.id !== CORE_ID && !hovered.fixed && mouse.inside){
+    const mw = toWorld(mouse.x, mouse.y);
+    hovered.vx += (mw.x - hovered.x) * 0.06;
+    hovered.vy += (mw.y - hovered.y) * 0.06;
+  }
   // gravity + integration
   const cx = 0, cy = 0;
   nodes.forEach(n => {
     n.vx += (cx-n.x)*0.007; n.vy += (cy-n.y)*0.007;
     n.vx *= 0.86; n.vy *= 0.86;
     n.x += n.vx * alpha; n.y += n.vy * alpha;
+    // remember where the node rests, and keep the magnetic pull local
+    if (n !== hovered || dragging){
+      n.restX = n.x; n.restY = n.y;
+    } else if (n.restX !== undefined){
+      const dx = n.x - n.restX, dy = n.y - n.restY, d = Math.hypot(dx, dy);
+      if (d > 64){ n.x = n.restX + dx * 64 / d; n.y = n.restY + dy * 64 / d; n.vx *= 0.2; n.vy *= 0.2; }
+    }
+    n.hover += ((n === hovered && !dragging) ? 1 - n.hover : -n.hover) * 0.25;
+    n.rNow = n.r * (1 + n.hover * 2.1) + n.hover * 3;
     const dist = Math.hypot(n.x, n.y), lim = 760;
     if (dist > lim){ n.x *= lim / dist; n.y *= lim / dist; }
   });
@@ -379,7 +410,7 @@ function render(){
     const retired = n.status && n.status !== 'active';
     // halo
     if (n.pinned || n.id === selected){
-      ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 4/view.k, 0, Math.PI*2);
+      ctx.beginPath(); ctx.arc(n.x, n.y, (n.rNow||n.r) + 4/view.k, 0, Math.PI*2);
       ctx.strokeStyle = col; ctx.globalAlpha = (lit?0.6:0.22);
       ctx.lineWidth = 1.6/view.k; ctx.stroke(); ctx.globalAlpha = lit ? 1 : 0.3;
     }
@@ -391,7 +422,8 @@ function render(){
       ctx.beginPath(); ctx.arc(n.x, n.y, n.r*2.6, 0, Math.PI*2);
       ctx.fillStyle = g; ctx.fill();
     }
-    ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
+    const rr = n.id === CORE_ID ? n.r : (n.rNow || n.r);
+    ctx.beginPath(); ctx.arc(n.x, n.y, rr, 0, Math.PI*2);
     ctx.fillStyle = retired ? '#0b0f17' : (n.id === CORE_ID ? '#dfe6ff' : col);
     ctx.fill();
     ctx.lineWidth = 1.4/view.k;
@@ -408,7 +440,7 @@ function render(){
       ctx.fillStyle = lit ? '#e5e7eb' : '#475569';
       ctx.globalAlpha = lit ? 0.92 : 0.22;
       const label = n.title.length > 18 ? n.title.slice(0,18)+'…' : n.title;
-      ctx.fillText(label, n.x + n.r + 4/view.k, n.y + 3.6/view.k);
+      ctx.fillText(label, n.x + (n.rNow||n.r) + 4/view.k, n.y + 3.6/view.k);
     }
   });
   ctx.restore();
@@ -428,13 +460,26 @@ function loop(){
 function toWorld(px, py){
   return { x: (px - (RAIL + W)/2 - view.x)/view.k, y: (py - H/2 - view.y)/view.k };
 }
+function pickNear(px, py, radius){
+  let best = null, bd = radius;
+  nodes.forEach(n => {
+    if (!visible(n)) return;
+    const d = Math.hypot(n.x * view.k - px + (RAIL + W)/2 - (RAIL + W)/2, n.y * view.k - py);
+    const sx = (RAIL + W)/2 + view.x + n.x * view.k;
+    const sy = H/2 + view.y + n.y * view.k;
+    const dist = Math.hypot(sx - px, sy - py);
+    if (dist < bd){ bd = dist; best = n; }
+  });
+  return best;
+}
+
 function pick(px, py){
   const p = toWorld(px, py);
   let best = null, bd = 1e9;
   nodes.forEach(n => {
     if (!visible(n)) return;
     const d = Math.hypot(n.x-p.x, n.y-p.y);
-    if (d < n.r + 6/view.k && d < bd){ bd = d; best = n; }
+    if (d < (n.rNow || n.r) + 7/view.k && d < bd){ bd = d; best = n; }
   });
   return best;
 }
@@ -453,25 +498,34 @@ function fit(){
 }
 
 function bind(){
-  let dragging = null, panning = false, last = null, moved = 0;
+  let panning = false, last = null, moved = 0;
   canvas.addEventListener('mousedown', ev => {
     const n = pick(ev.offsetX, ev.offsetY);
     moved = 0; last = {x:ev.offsetX, y:ev.offsetY};
     if (n && n.fixed){ select(n.id); return; }
+    hideBubble();
     if (n){ dragging = n; simAlpha = Math.max(simAlpha, .35); }
     else { panning = true; canvas.classList.add('grabbing'); }
   });
   window.addEventListener('mousemove', ev => {
     const rect = canvas.getBoundingClientRect();
     const x = ev.clientX-rect.left, y = ev.clientY-rect.top;
+    mouse.x = x; mouse.y = y; mouse.inside = true;
     if (dragging){
       const w = toWorld(x, y); dragging.x = w.x; dragging.y = w.y;
       dragging.vx = dragging.vy = 0; simAlpha = Math.max(simAlpha, .3); moved += 5;
     } else if (panning && last){
       view.x += x-last.x; view.y += y-last.y; last = {x,y}; moved += 5;
     } else {
-      const h = pick(x,y);
-      if ((h&&h.id)!==(hovered&&hovered.id)){ hovered = h; canvas.style.cursor = h?'pointer':'grab'; }
+      const h = pickNear(x, y, 72);
+      if ((h&&h.id)!==(hovered&&hovered.id)){
+        hovered = h;
+        canvas.style.cursor = h ? 'pointer' : 'grab';
+        if (h) { simAlpha = Math.max(simAlpha, 0.25); showBubble(h, x, y); }
+        else hideBubble();
+      } else if (h){
+        showBubble(h, x, y);
+      }
     }
   });
   window.addEventListener('mouseup', ev => {
@@ -481,6 +535,7 @@ function bind(){
     else if (panning && moved < 6){ const h = pick(x,y); if (h) select(h.id); else closePanel(); }
     dragging = null; panning = false; canvas.classList.remove('grabbing');
   });
+  canvas.addEventListener('mouseleave', () => { hovered = null; mouse.inside = false; hideBubble(); });
   canvas.addEventListener('wheel', ev => {
     ev.preventDefault();
     const rect = canvas.getBoundingClientRect();
@@ -500,6 +555,30 @@ function bind(){
       document.getElementById('q').value=''; query=''; document.getElementById('q').blur(); closePanel(); updateMeta();
     }
   });
+}
+
+function showBubble(n, sx, sy){
+  const b = document.getElementById('bubble');
+  if (bubbleFor === n.id && b.classList.contains('show')){
+    b.style.left = Math.min(sx + 16, W - 360) + 'px';
+    b.style.top = Math.min(sy + 16, H - 200) + 'px';
+    return;
+  }
+  bubbleFor = n.id;
+  const d = new Date((n.created_at||0)*1000);
+  const date = isNaN(d) ? '' : d.toLocaleDateString('zh-CN');
+  b.innerHTML = `<div class="bt">${esc(n.title)}</div>
+    <div class="bm">${esc(n.kind)} · ${esc(n.project||'—')} · ${date} · 连接 ${n.deg||0}</div>
+    <div class="bp">${esc((n.preview||'').slice(0, 260))}</div>
+    ${(n.tags||[]).slice(0,4).map(t=>`<span class="bk">${esc(t)}</span>`).join('')}`;
+  b.style.left = Math.min(sx + 16, W - 360) + 'px';
+  b.style.top = Math.min(sy + 16, H - 200) + 'px';
+  b.classList.add('show');
+}
+
+function hideBubble(){
+  bubbleFor = null;
+  document.getElementById('bubble').classList.remove('show');
 }
 
 function focusNode(n){
@@ -791,11 +870,16 @@ async function boot(){
       const el = document.getElementById(id); if (el) el.disabled = true;
     });
   }
-  window.__mem = { select, fit, get data(){ return DATA; } };
+  window.__mem = { select, fit, hover(id){
+    const n = byId.get(id); if (!n) return;
+    hovered = n; n.hover = 1; n.rNow = n.r * 2.35 + 2.5;
+    showBubble(n, W/2 + n.x * view.k, H/2 + n.y * view.k);
+    simAlpha = Math.max(simAlpha, 0.2); dirty = true;
+  }, get data(){ return DATA; } };
   running = true; loop();
   updateMeta();
 }
-boot();
+boot().catch(e => { document.title = 'ERR: ' + (e && e.message ? e.message : e); console.error(e); });
 </script>
 </body>
 </html>
