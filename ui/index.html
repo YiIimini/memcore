@@ -363,7 +363,7 @@ function render(){
     ctx.strokeStyle = retired ? col : 'rgba(0,0,0,.35)';
     ctx.stroke();
 
-    if (showLabels && (n.deg >= 2 || n.id === focus || view.k > 1.5)){
+    if (showLabels && (n.id === focus || n.deg >= 6 || (view.k > 0.85 && n.deg >= 3))){
       const fs = Math.max(10/view.k, 9.5/view.k + 1.5/view.k);
       ctx.font = `${fs}px -apple-system,"PingFang SC",sans-serif`;
       ctx.fillStyle = lit ? '#e5e7eb' : '#475569';
