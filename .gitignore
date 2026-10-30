@@ -1,0 +1,15 @@
+# runtime data & secrets — never commit
+secrets.json
+*.db
+*.db-wal
+*.db-shm
+cache/
+BRIEF.md
+MEMORY.md
+maintain.log
+graph.html
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+node_modules/

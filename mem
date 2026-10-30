@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""mem — CLI for the agent's long-term memory (memcore).
+
+Examples
+--------
+  mem add -k preference -t "输出格式" -b "YG 要中文、直接给结果、不要前置说明" --tags style,lang --pin
+  mem recall "上次插件清单是怎么整理的" --budget 900
+  mem brief --budget 700 --save
+  mem ingest                      # 灌入历史会话
+  mem search "记忆系统" --kind decision --json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+from memcore import Memory, KIND_DEFAULTS, est_tokens  # noqa: E402
+
+
+UI_TEMPLATE = os.path.join(HERE, "ui", "index.html")
+
+
+def render_ui(data) -> str:
+    with open(UI_TEMPLATE, "r", encoding="utf-8") as fh:
+        tpl = fh.read()
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return tpl.replace("__DATA__", payload)
+
+
+def parse_when(v):
+    """Accept epoch seconds, YYYY-MM-DD, or 'YYYY-MM-DD HH:MM'."""
+    if v in (None, ""):
+        return None
+    v = str(v).strip()
+    if v.isdigit():
+        return int(v)
+    import datetime
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d", "%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(v, fmt)
+            if fmt == "%m-%d":
+                dt = dt.replace(year=datetime.date.today().year)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    raise SystemExit("bad date: %s (use YYYY-MM-DD or epoch)" % v)
+
+
+def out(s: str = "") -> None:
+    sys.stdout.write(s + "\n")
+
+
+def dump(obj) -> None:
+    out(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # allow `mem <cmd> --json` as well as `mem --json <cmd>`
+    if "--json" in argv[1:]:
+        argv = ["--json"] + [a for a in argv if a != "--json"]
+    ap = argparse.ArgumentParser(prog="mem", description="agent long-term memory")
+    ap.add_argument("--home", default=None, help="memory home (default ~/.dsh/memory)")
+    ap.add_argument("--json", action="store_true", help="JSON output")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("add", help="write a memory")
+    p.add_argument("-b", "--body", required=True)
+    p.add_argument("-t", "--title", default="")
+    p.add_argument("-k", "--kind", default="note", choices=sorted(KIND_DEFAULTS))
+    p.add_argument("--tags", default="")
+    p.add_argument("-p", "--project", default="")
+    p.add_argument("--source", default="manual")
+    p.add_argument("--source-ref", default="")
+    p.add_argument("--salience", type=float, default=None)
+    p.add_argument("--confidence", type=float, default=0.7)
+    p.add_argument("--pin", action="store_true")
+    p.add_argument("--ttl-days", type=int, default=0)
+    p.add_argument("--no-dedupe", action="store_true")
+
+    for name in ("search", "s"):
+        p = sub.add_parser(name, help="ranked search")
+        p.add_argument("query")
+        p.add_argument("-n", "--limit", type=int, default=10)
+        p.add_argument("-p", "--project", default="")
+        p.add_argument("-k", "--kind", action="append", default=[])
+        p.add_argument("--tags", default="")
+        p.add_argument("--min-score", type=float, default=0.0)
+        p.add_argument("--as-of", default=None, help="YYYY-MM-DD 或 epoch：回到该时点的有效记忆")
+
+    for name in ("recall", "r"):
+        p = sub.add_parser(name, help="budget-packed context for a query")
+        p.add_argument("query")
+        p.add_argument("--budget", type=int, default=900)
+        p.add_argument("-p", "--project", default="")
+        p.add_argument("-k", "--kind", action="append", default=[])
+        p.add_argument("--compact", action="store_true")
+        p.add_argument("--as-of", default=None)
+
+    p = sub.add_parser("brief", help="session-start capsule")
+    p.add_argument("--budget", type=int, default=800)
+    p.add_argument("-p", "--project", default="")
+    p.add_argument("--save", action="store_true")
+
+    p = sub.add_parser("get", help="show one memory")
+    p.add_argument("id")
+
+    p = sub.add_parser("update", help="edit fields")
+    p.add_argument("id")
+    p.add_argument("-t", "--title")
+    p.add_argument("-b", "--body")
+    p.add_argument("-k", "--kind")
+    p.add_argument("--tags")
+    p.add_argument("-p", "--project")
+    p.add_argument("--salience", type=float)
+    p.add_argument("--pin", dest="pinned", action="store_true")
+    p.add_argument("--unpin", dest="pinned", action="store_false")
+
+    p = sub.add_parser("forget", help="delete one memory")
+    p.add_argument("id")
+
+    p = sub.add_parser("link", help="connect two memories")
+    p.add_argument("src")
+    p.add_argument("dst")
+    p.add_argument("--rel", default="related")
+    p.add_argument("--weight", type=float, default=1.0)
+
+    p = sub.add_parser("retire", help="close a memory's validity window")
+    p.add_argument("id")
+    p.add_argument("--by", default=None, help="id of the newer memory that supersedes it")
+    p.add_argument("--reason", default="")
+
+    p = sub.add_parser("history", help="supersedes chain around one memory")
+    p.add_argument("id")
+
+    p = sub.add_parser("relink", help="rebuild semantic related-edges")
+    p.add_argument("--limit", type=int, default=4000)
+
+    p = sub.add_parser("consolidate", help="find/merge duplicate & conflicting memories")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--llm", action="store_true", help="use MEM_LLM_* endpoint to adjudicate")
+    p.add_argument("--limit", type=int, default=400)
+
+    p = sub.add_parser("ui", help="render a standalone Obsidian-style graph page")
+    p.add_argument("--out", default=None)
+    p.add_argument("--project", default="")
+    p.add_argument("--limit", type=int, default=700)
+
+    p = sub.add_parser("serve", help="live graph UI + JSON API on 127.0.0.1")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--open", action="store_true")
+
+    p = sub.add_parser("graph", help="neighbourhood of a memory")
+    p.add_argument("id")
+    p.add_argument("--depth", type=int, default=1)
+
+    p = sub.add_parser("timeline", help="recent activity")
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("-p", "--project", default="")
+    p.add_argument("-n", "--limit", type=int, default=40)
+
+    p = sub.add_parser("ingest", help="import dsh session archives")
+    p.add_argument("--root", default=None)
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("-p", "--project", default="")
+    p.add_argument("--force", action="store_true", help="re-import even if unchanged")
+
+    p = sub.add_parser("export", help="render Markdown index / JSONL")
+    p.add_argument("--path", default=None)
+    p.add_argument("--jsonl", default=None)
+
+    sub.add_parser("maintain", help="ingest + relink + gc + export（一条命令做完日常维护）")
+    sub.add_parser("stats", help="counts and size")
+    sub.add_parser("reindex", help="rebuild FTS + vectors")
+    p = sub.add_parser("gc", help="drop expired/cold items")
+    p.add_argument("--dry-run", action="store_true")
+    sub.add_parser("doctor", help="self-check")
+
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        ap.print_help()
+        return 2
+
+    m = Memory(args.home)
+    try:
+        if args.cmd == "add":
+            tags = [t for t in args.tags.split(",") if t.strip()]
+            r = m.add(args.body, title=args.title, kind=args.kind, tags=tags, project=args.project,
+                      source=args.source, source_ref=args.source_ref, salience=args.salience,
+                      confidence=args.confidence, pinned=args.pin, ttl_days=args.ttl_days,
+                      dedupe=not args.no_dedupe)
+            m.export_markdown()
+            if args.json:
+                dump(r)
+            else:
+                tail = " (deduped:%s)" % r["deduped"] if r.get("deduped") else ""
+                out("%s %s%s" % (r["id"], (args.title or args.body)[:60], tail))
+            return 0
+
+        if args.cmd in ("search", "s"):
+            hits = m.search(args.query, limit=args.limit, project=args.project,
+                            kinds=args.kind, tags=[t for t in args.tags.split(",") if t],
+                            min_score=args.min_score, as_of=parse_when(args.as_of))
+            if args.json:
+                dump(hits)
+            else:
+                if not hits:
+                    out("(no hits)")
+                for h in hits:
+                    out("%s  %.3f  lex=%.2f sem=%.2f  %s  %s  %s" % (
+                        h["id"], h["score"], h["lexical"], h["semantic"], h["kind"],
+                        h["project"] or "-", h["title"]))
+            return 0
+
+        if args.cmd in ("recall", "r"):
+            r = m.recall(args.query, budget_tokens=args.budget, project=args.project,
+                         kinds=args.kind, compact=args.compact, as_of=parse_when(args.as_of))
+            if args.json:
+                dump(r)
+            else:
+                out(r["text"])
+            return 0
+
+        if args.cmd == "brief":
+            txt = m.brief(budget_tokens=args.budget, project=args.project)
+            if args.save:
+                path = os.path.join(m.home, "BRIEF.md")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(txt)
+                if not args.json:
+                    out("saved %s" % path)
+            if args.json:
+                dump({"text": txt, "tokens": est_tokens(txt)})
+            elif not args.save:
+                out(txt)
+            return 0
+
+        if args.cmd == "get":
+            r = m.get(args.id)
+            if not r:
+                out("not found: %s" % args.id)
+                return 1
+            if args.json:
+                dump(r)
+            else:
+                out("%s  [%s/%s]  %s" % (r["id"], r["kind"], r["project"] or "-",
+                                         time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created_at"]))))
+                out("title: %s" % r["title"])
+                out("tags : %s" % r["tags"])
+                out("meta : salience=%.2f conf=%.2f pinned=%s uses=%d src=%s" % (
+                    r["salience"], r["confidence"], bool(r["pinned"]), r["use_count"], r["source"]))
+                out("-" * 60)
+                out(r["body"])
+            return 0
+
+        if args.cmd == "update":
+            fields = {}
+            for k in ("title", "body", "kind", "project", "salience"):
+                v = getattr(args, k, None)
+                if v is not None:
+                    fields[k] = v
+            if args.tags is not None:
+                fields["tags"] = [t for t in args.tags.split(",") if t]
+            if args.pinned is not None:
+                fields["pinned"] = args.pinned
+            ok = m.update(args.id, **fields)
+            m.export_markdown()
+            out("updated" if ok else "no-op")
+            return 0 if ok else 1
+
+        if args.cmd == "forget":
+            ok = m.forget(args.id)
+            m.export_markdown()
+            out("forgotten" if ok else "not found")
+            return 0 if ok else 1
+
+        if args.cmd == "link":
+            ok = m.link(args.src, args.dst, args.rel, args.weight)
+            out("linked" if ok else "missing endpoint")
+            return 0 if ok else 1
+
+        if args.cmd == "retire":
+            ok = m.retire(args.id, by=args.by, reason=args.reason)
+            m.export_markdown()
+            out("retired" if ok else "not found")
+            return 0 if ok else 1
+
+        if args.cmd == "history":
+            h = m.history(args.id)
+            for r in h["chain"]:
+                mark = "●" if r["id"] == args.id else "○"
+                out("%s %s  %s  %s  %s" % (mark, r["id"],
+                    time.strftime("%m-%d %H:%M", time.localtime(r["created_at"])),
+                    r["status"], r["title"][:60]))
+            return 0
+
+        if args.cmd == "relink":
+            n = m.relink(limit=args.limit)
+            out("related edges: %d" % n)
+            return 0
+
+        if args.cmd == "consolidate":
+            rep = m.consolidate(dry_run=not args.apply, llm=args.llm, limit=args.limit)
+            if args.json:
+                dump(rep)
+            else:
+                for r in rep:
+                    out("%-7s %.3f  %s ~ %s  %s" % (r["action"], r["sim"], r["a"], r["b"],
+                                                     " / ".join(r["titles"])[:80]))
+                out("%d candidate pair(s), %s" % (len(rep), "applied" if args.apply else "dry-run"))
+            if args.apply:
+                m.export_markdown()
+            return 0
+
+        if args.cmd == "ui":
+            data = m.graph_export(project=args.project, limit=args.limit)
+            path = args.out or os.path.join(m.home, "graph.html")
+            html = render_ui(data)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+            out("wrote %s (%d nodes, %d edges)" % (path, len(data["nodes"]), len(data["edges"])))
+            return 0
+
+        if args.cmd == "serve":
+            from server import serve
+            serve(m, port=args.port, open_browser=args.open)
+            return 0
+
+        if args.cmd == "graph":
+            g = m.graph(args.id, args.depth)
+            if args.json:
+                dump(g)
+            else:
+                for n in g["nodes"]:
+                    out("%s%s [%s] %s" % ("  " * n["depth"], n["id"], n["kind"], n["title"]))
+                for e in g["edges"]:
+                    out("  %s -%s-> %s (%.1f)" % (e["src"], e["rel"], e["dst"], e["w"]))
+            return 0
+
+        if args.cmd == "timeline":
+            for r in m.timeline(args.days, args.project, args.limit):
+                out("%s  %s  %-9s %-18s %s" % (
+                    time.strftime("%m-%d %H:%M", time.localtime(r["created_at"])),
+                    r["id"], r["kind"], (r["project"] or "-")[:18], r["title"][:60]))
+            return 0
+
+        if args.cmd == "ingest":
+            r = m.ingest_sessions(args.root, args.limit, args.project, force=args.force)
+            m.export_markdown()
+            dump(r) if args.json else out("sessions=%d added=%d %s" % (
+                r.get("sessions", 0), r.get("added", 0), r.get("note", "")))
+            return 0
+
+        if args.cmd == "export":
+            p = m.export_markdown(args.path)
+            extra = ""
+            if args.jsonl:
+                n = m.export_jsonl(args.jsonl)
+                extra = " + %d jsonl" % n
+            out("wrote %s%s" % (p, extra))
+            return 0
+
+        if args.cmd == "maintain":
+            r = m.maintain()
+            if args.json:
+                dump(r)
+            else:
+                out("ingest=%d added=%d | related edges +%d | gc -%d | total %d"
+                    % (r["ingest"].get("sessions", 0), r["ingest"].get("added", 0),
+                       r["new_edges"], r["gc"], r["total"]))
+            return 0
+
+        if args.cmd == "stats":
+            dump(m.stats())
+            return 0
+
+        if args.cmd == "reindex":
+            n = m.reindex()
+            out("reindexed %d" % n)
+            return 0
+
+        if args.cmd == "gc":
+            dump(m.gc(dry_run=args.dry_run))
+            return 0
+
+        if args.cmd == "doctor":
+            problems = []
+            try:
+                m.db.execute("SELECT count(*) FROM mem_fts").fetchone()
+            except Exception as e:
+                problems.append("fts: %s" % e)
+            n_vec = m.db.execute("SELECT count(*) c FROM vectors").fetchone()["c"]
+            n_mem = m.db.execute("SELECT count(*) c FROM memories").fetchone()["c"]
+            if n_vec != n_mem:
+                problems.append("vectors %d != memories %d (run: mem reindex)" % (n_vec, n_mem))
+            probe = m.search("测试 probe", limit=1)
+            dump({"home": m.home, "memories": n_mem, "vectors": n_vec,
+                  "fts": "ok", "search_ok": True, "problems": problems})
+            return 0
+
+        ap.print_help()
+        return 2
+    finally:
+        m.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

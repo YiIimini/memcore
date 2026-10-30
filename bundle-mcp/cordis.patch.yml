@@ -1,0 +1,10 @@
+- insert:
+    - id: memory-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: memory
+        transport: stdio
+        command: /usr/bin/python3
+        args:
+          - /Users/x/.dsh/memory-core/mem_mcp.py
+        failOnStartupError: false

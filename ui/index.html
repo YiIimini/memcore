@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Memory Graph · memcore</title>
+<style>
+  :root{
+    --bg:#0b0f17; --panel:#111827; --panel2:#0f1623; --line:#1f2937;
+    --fg:#e5e7eb; --dim:#94a3b8; --accent:#60a5fa;
+    --identity:#f472b6; --preference:#a78bfa; --decision:#60a5fa; --fact:#34d399;
+    --project:#fbbf24; --artifact:#fb923c; --insight:#22d3ee; --episode:#94a3b8;
+    --todo:#ef4444; --note:#64748b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:13px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    overflow:hidden;-webkit-font-smoothing:antialiased}
+  #stage{position:fixed;inset:0}
+  canvas{display:block;width:100%;height:100%;cursor:grab}
+  canvas.grabbing{cursor:grabbing}
+
+  /* ---- left rail ---- */
+  #rail{position:fixed;top:0;left:0;bottom:0;width:272px;background:linear-gradient(180deg,#0d1420f2,#0b0f17f2);
+    border-right:1px solid var(--line);backdrop-filter:blur(8px);padding:14px 14px 10px;display:flex;flex-direction:column;gap:12px;z-index:5}
+  .brand{display:flex;align-items:center;gap:8px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent)}
+  .brand b{font-size:13px;letter-spacing:.3px}
+  .brand span{font-size:11px;color:var(--dim)}
+  #q{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0a0f18;color:var(--fg);outline:none}
+  #q:focus{border-color:#2563eb;box-shadow:0 0 0 3px #2563eb22}
+  .hint{font-size:11px;color:var(--dim)}
+  .section-title{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin:2px 0 -4px}
+  #kinds{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;border:1px solid var(--line);
+    background:#0a0f18;color:var(--dim);cursor:pointer;user-select:none;font-size:11px;transition:.15s}
+  .chip .sw{width:8px;height:8px;border-radius:50%}
+  .chip.on{color:var(--fg);border-color:#334155;background:#131c2b}
+  .chip.off{opacity:.35}
+  select{width:100%;padding:7px 8px;border-radius:8px;border:1px solid var(--line);background:#0a0f18;color:var(--fg)}
+  .row{display:flex;gap:8px}
+  button{flex:1;padding:7px 8px;border-radius:8px;border:1px solid var(--line);background:#0a0f18;color:var(--fg);cursor:pointer}
+  button:hover{border-color:#334155;background:#121a27}
+  #meta{margin-top:auto;font-size:11px;color:var(--dim);line-height:1.7}
+  #meta b{color:var(--fg);font-weight:600}
+
+  /* ---- detail panel ---- */
+  #panel{position:fixed;top:0;right:0;bottom:0;width:392px;background:#0d1420f7;border-left:1px solid var(--line);
+    backdrop-filter:blur(10px);transform:translateX(100%);transition:transform .22s cubic-bezier(.2,.8,.2,1);
+    display:flex;flex-direction:column;z-index:6}
+  #panel.open{transform:none}
+  #phead{padding:14px 16px 10px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:flex-start}
+  #phead .t{font-size:14px;font-weight:600;line-height:1.4}
+  #pclose{margin-left:auto;width:26px;height:26px;flex:none;border-radius:6px;border:1px solid var(--line);
+    background:transparent;color:var(--dim);cursor:pointer;line-height:1}
+  #pbody{overflow:auto;padding:12px 16px 20px;font-size:12.5px}
+  .kv{color:var(--dim);font-size:11px;margin-bottom:10px;display:flex;flex-wrap:wrap;gap:6px 12px}
+  .kv i{font-style:normal;color:var(--fg)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:999px;background:#16213a;color:#93c5fd;font-size:10.5px;margin-right:4px}
+  .body{white-space:pre-wrap;color:#cbd5e1;background:#0a0f18;border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0 14px}
+  .links .lk{display:flex;gap:6px;align-items:baseline;padding:5px 0;border-bottom:1px dashed #1b2436;cursor:pointer}
+  .links .lk:hover{color:var(--accent)}
+  .lk .rel{font-size:10px;color:var(--dim);min-width:74px}
+  .lk .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .empty{color:var(--dim);font-size:12px}
+
+  .gear{margin-left:auto;width:26px;height:26px;flex:none;border-radius:7px;border:1px solid var(--line);
+    background:#0a0f18;color:var(--dim);cursor:pointer;line-height:1;font-size:14px}
+  .gear:hover{color:var(--fg);border-color:#334155}
+  #modal{position:fixed;inset:0;background:#05080ecc;backdrop-filter:blur(3px);display:none;
+    align-items:center;justify-content:center;z-index:20}
+  #modal.open{display:flex}
+  .card{width:min(560px,92vw);max-height:86vh;overflow:auto;background:#0d1420;border:1px solid #223047;
+    border-radius:14px;padding:18px 20px;box-shadow:0 24px 80px #000a}
+  .card h2{margin:0 0 2px;font-size:15px}
+  .card .sub{color:var(--dim);font-size:11.5px;margin-bottom:14px}
+  .card h3{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin:16px 0 8px}
+  .field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+  .field label{font-size:11.5px;color:var(--dim)}
+  .field input,.field textarea,.field select{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);
+    background:#080d15;color:var(--fg);outline:none;font:12.5px/1.5 inherit}
+  .field input:focus,.field textarea:focus{border-color:#2563eb}
+  .field textarea{min-height:54px;resize:vertical}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .btnrow{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}
+  .btn{flex:0 0 auto;padding:7px 14px;border-radius:8px;border:1px solid var(--line);background:#101827;color:var(--fg);cursor:pointer;font-size:12px}
+  .btn:hover{border-color:#334155}
+  .btn.primary{background:#1d4ed8;border-color:#1d4ed8}
+  .btn.primary:hover{background:#2563eb}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .status{font-size:11.5px;color:var(--dim);margin-top:10px;line-height:1.7}
+  .status b{color:var(--fg)}
+  .readonly{background:#2a1a0e;border:1px solid #5a3a12;color:#fbbf24;padding:8px 10px;border-radius:8px;font-size:11.5px;margin-bottom:12px}
+  #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);opacity:0;
+    background:#111827e6;border:1px solid var(--line);padding:7px 14px;border-radius:999px;font-size:12px;
+    transition:.2s;pointer-events:none;z-index:9}
+  #toast.show{opacity:1;transform:translateX(-50%)}
+  @media (max-width:820px){#rail{width:220px}#panel{width:100%}}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+
+<aside id="rail">
+  <div class="brand"><span class="dot"></span><b>Memory Graph</b><span>memcore</span>
+    <button class="gear" id="gear" title="设置">⚙</button></div>
+  <input id="q" placeholder="搜索记忆…  ( / 聚焦, Esc 清空 )" autocomplete="off" />
+  <div class="hint" id="qhint">点击节点看详情 · 拖拽布局 · 滚轮缩放</div>
+
+  <div class="section-title">类型</div>
+  <div id="kinds"></div>
+
+  <div class="section-title">项目</div>
+  <select id="proj"><option value="">全部项目</option></select>
+
+  <div class="row">
+    <button id="fit">适配</button>
+    <button id="relayout">重排</button>
+  </div>
+  <div class="row">
+    <button id="labels">标签：开</button>
+    <button id="retired">含失效</button>
+  </div>
+
+  <div id="meta"></div>
+</aside>
+
+<section id="panel">
+  <div id="phead">
+    <div class="t" id="ptitle">—</div>
+    <button id="pclose">✕</button>
+  </div>
+  <div id="pbody"><div class="empty">选择一个节点</div></div>
+</section>
+
+<div id="modal">
+  <div class="card">
+    <h2>设置</h2>
+    <div class="sub">配置存在 <code>~/.dsh/memory/config.json</code>，密钥写 <code>secrets.json</code>（0600，不回显）</div>
+    <div id="ro" class="readonly" style="display:none">只读模式：请用 <code>mem serve</code> 打开本页再保存设置。</div>
+
+    <h3>大模型裁判（可选）</h3>
+    <div class="row2">
+      <div class="field"><label>Base URL</label><input id="s-base" placeholder="https://api.deepseek.com/v1"></div>
+      <div class="field"><label>Model</label><input id="s-model" placeholder="deepseek-chat"></div>
+    </div>
+    <div class="field"><label>API Key <span id="s-keyhint" class="hint"></span></label>
+      <input id="s-key" type="password" placeholder="sk-...（留空表示不修改）" autocomplete="off"></div>
+
+    <h3>自动维护</h3>
+    <div class="row2">
+      <div class="field"><label>后台维护</label>
+        <select id="s-auto"><option value="1">开启</option><option value="0">关闭</option></select></div>
+      <div class="field"><label>间隔</label>
+        <select id="s-interval">
+          <option value="15">15 分钟</option><option value="30">30 分钟</option>
+          <option value="60">1 小时</option><option value="180">3 小时</option>
+        </select></div>
+    </div>
+    <div class="btnrow">
+      <button class="btn" id="act-maintain">立即维护</button>
+      <button class="btn" id="act-relink">重建关系边</button>
+      <button class="btn" id="act-reindex">重建索引</button>
+      <button class="btn" id="act-export">导出 MEMORY.md</button>
+    </div>
+
+    <h3>隐私排除（不灌入 / 不检索）</h3>
+    <div class="field"><label>排除项目（每行一个，匹配会话所在目录名）</label>
+      <textarea id="s-xprojects" placeholder="例如 private-notes"></textarea></div>
+    <div class="field"><label>排除路径前缀（每行一个）</label>
+      <textarea id="s-xpaths" placeholder="例如 ~/work/secret-project"></textarea></div>
+    <div class="field"><label>排除关键词（记忆正文命中即跳过）</label>
+      <textarea id="s-xkeywords" placeholder="例如 身份证 / 银行卡"></textarea></div>
+
+    <div class="btnrow" style="margin-top:14px">
+      <button class="btn primary" id="s-save">保存设置</button>
+      <button class="btn" id="s-close">关闭</button>
+    </div>
+    <div class="status" id="s-status"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const EMBEDDED = __DATA__;
+const KIND_COLOR = {
+  identity:'#f472b6', preference:'#a78bfa', decision:'#60a5fa', fact:'#34d399',
+  project:'#fbbf24', artifact:'#fb923c', insight:'#22d3ee', episode:'#94a3b8',
+  todo:'#ef4444', note:'#64748b'
+};
+const REL_STYLE = {
+  related:{color:'#3b82f6', dash:[], w:1},
+  supersedes:{color:'#ef4444', dash:[5,4], w:1.4},
+  documents:{color:'#a78bfa', dash:[2,3], w:1},
+  produces:{color:'#f59e0b', dash:[2,3], w:1},
+  'same-entity':{color:'#22d3ee', dash:[], w:1}
+};
+
+let DATA = {nodes:[], edges:[], meta:{}};
+let nodes = [], edges = [], byId = new Map();
+let hidden = new Set();
+let activeKinds = new Set(Object.keys(KIND_COLOR));
+let project = '';
+let showLabels = true;
+let showRetired = false;
+let query = '';
+let hovered = null, selected = null;
+let view = {x:0, y:0, k:1};
+let canvas, ctx, W=0, H=0, DPR=1;
+const RAIL = 272;
+let fitPending = true;
+let simAlpha = 1;
+
+/* ---------------- data ---------------- */
+async function load(){
+  let d = EMBEDDED;
+  if (location.protocol.startsWith('http')) {
+    try {
+      const r = await fetch('/api/graph?limit=1500&include_retired=' + (showRetired?1:0));
+      if (r.ok) d = await r.json();
+    } catch(e) {}
+  }
+  DATA = d || {nodes:[],edges:[],meta:{}};
+  build();
+}
+
+function build(){
+  nodes = DATA.nodes.map(n => Object.assign({}, n, {
+    x: (Math.random()-.5)*600, y:(Math.random()-.5)*600, vx:0, vy:0, r:6
+  }));
+  byId = new Map(nodes.map(n => [n.id, n]));
+  edges = DATA.edges.filter(e => byId.has(e.source) && byId.has(e.target))
+    .map(e => ({...e, a: byId.get(e.source), b: byId.get(e.target)}));
+  const deg = new Map();
+  edges.forEach(e => { deg.set(e.source,(deg.get(e.source)||0)+1); deg.set(e.target,(deg.get(e.target)||0)+1); });
+  nodes.forEach(n => {
+    n.deg = deg.get(n.id) || 0;
+    n.r = 4 + Math.sqrt(n.deg)*1.9 + (n.salience||0)*4.2;
+  });
+  fillProjects();
+  // settle synchronously so the first frame is already a readable layout
+  simAlpha = 1;
+  const pre = nodes.length <= 300 ? 240 : 60;
+  for (let t=0;t<pre;t++) tick();
+  simAlpha = 0.06;
+  fit();
+  render();
+  updateMeta();
+}
+
+function fillProjects(){
+  const sel = document.getElementById('proj');
+  const set = new Set(nodes.map(n => n.project).filter(Boolean));
+  sel.innerHTML = '<option value="">全部项目</option>' +
+    [...set].sort().map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+}
+
+/* ---------------- simulation ---------------- */
+function tick(){
+  const N = nodes.length || 1;
+  const k = Math.sqrt((W*H) / N) * 0.36;
+  const alpha = simAlpha;
+  // repulsion (capped N^2, fine to a few thousand)
+  for (let i=0;i<nodes.length;i++){
+    const a = nodes[i];
+    for (let j=i+1;j<nodes.length;j++){
+      const b = nodes[j];
+      let dx = b.x-a.x, dy = b.y-a.y;
+      let d2 = dx*dx+dy*dy;
+      if (d2 < 0.01){ dx = Math.random()-.5; dy = Math.random()-.5; d2 = 0.01; }
+      if (d2 > 90000) continue;
+      const d = Math.sqrt(d2);
+      const f = (k*k) / d2 * 0.55;
+      const fx = dx/d*f, fy = dy/d*f;
+      a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
+    }
+  }
+  // springs
+  edges.forEach(e => {
+    let dx = e.b.x-e.a.x, dy = e.b.y-e.a.y;
+    const d = Math.max(0.1, Math.hypot(dx,dy));
+    const rest = 54 + (e.a.r+e.b.r)*2.2;
+    const f = (d - rest) * 0.02 * (0.4 + (e.w||0.4));
+    const fx = dx/d*f, fy = dy/d*f;
+    e.a.vx += fx; e.a.vy += fy; e.b.vx -= fx; e.b.vy -= fy;
+  });
+  // gravity + integration
+  const cx = 0, cy = 0;
+  nodes.forEach(n => {
+    n.vx += (cx-n.x)*0.0042; n.vy += (cy-n.y)*0.0042;
+    n.vx *= 0.86; n.vy *= 0.86;
+    n.x += n.vx * alpha; n.y += n.vy * alpha;
+  });
+  simAlpha = Math.max(0.004, simAlpha * 0.99);
+}
+
+/* ---------------- render ---------------- */
+function resize(){
+  DPR = window.devicePixelRatio || 1;
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W*DPR; canvas.height = H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+
+function visible(n){
+  if (!activeKinds.has(n.kind)) return false;
+  if (project && n.project !== project) return false;
+  if (!showRetired && n.status && n.status !== 'active') return false;
+  if (query){
+    const hay = (n.title+' '+(n.preview||'')+' '+(n.tags||[]).join(' ')).toLowerCase();
+    if (!query.toLowerCase().split(/\s+/).every(t => hay.includes(t))) return false;
+  }
+  return true;
+}
+
+function neighborsOf(id){
+  const s = new Set([id]);
+  edges.forEach(e => { if (e.source===id) s.add(e.target); if (e.target===id) s.add(e.source); });
+  return s;
+}
+
+function render(){
+  const focus = hovered || selected;
+  const near = focus ? neighborsOf(focus) : null;
+  ctx.save();
+  ctx.clearRect(0,0,W,H);
+  ctx.translate((RAIL + W)/2 + view.x, H/2 + view.y);
+  ctx.scale(view.k, view.k);
+
+  // edges
+  edges.forEach(e => {
+    const vis = visible(e.a) && visible(e.b);
+    if (!vis) return;
+    const st = REL_STYLE[e.rel] || REL_STYLE.related;
+    const lit = near && (near.has(e.source) && near.has(e.target));
+    ctx.strokeStyle = st.color;
+    ctx.globalAlpha = lit ? 0.95 : (near ? 0.1 : 0.24);
+    ctx.lineWidth = (st.w || 1) * (lit ? 1.8 : 1) / view.k;
+    ctx.setLineDash(st.dash.map(x => x/view.k));
+    ctx.beginPath();
+    ctx.moveTo(e.a.x, e.a.y); ctx.lineTo(e.b.x, e.b.y); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // nodes
+  nodes.forEach(n => {
+    if (!visible(n)) return;
+    const lit = !near || near.has(n.id);
+    const col = KIND_COLOR[n.kind] || '#64748b';
+    ctx.globalAlpha = lit ? 1 : 0.3;
+    const retired = n.status && n.status !== 'active';
+    // halo
+    if (n.pinned || n.id === selected){
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 4/view.k, 0, Math.PI*2);
+      ctx.strokeStyle = col; ctx.globalAlpha = (lit?0.6:0.22);
+      ctx.lineWidth = 1.6/view.k; ctx.stroke(); ctx.globalAlpha = lit ? 1 : 0.3;
+    }
+    ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
+    ctx.fillStyle = retired ? '#0b0f17' : col;
+    ctx.fill();
+    ctx.lineWidth = 1.4/view.k;
+    ctx.strokeStyle = retired ? col : 'rgba(0,0,0,.35)';
+    ctx.stroke();
+
+    if (showLabels && (n.deg >= 2 || n.id === focus || view.k > 1.5)){
+      const fs = Math.max(10/view.k, 9.5/view.k + 1.5/view.k);
+      ctx.font = `${fs}px -apple-system,"PingFang SC",sans-serif`;
+      ctx.fillStyle = lit ? '#e5e7eb' : '#475569';
+      ctx.globalAlpha = lit ? 0.92 : 0.22;
+      const label = n.title.length > 18 ? n.title.slice(0,18)+'…' : n.title;
+      ctx.fillText(label, n.x + n.r + 4/view.k, n.y + 3.6/view.k);
+    }
+  });
+  ctx.restore();
+  dirty = false;
+}
+
+let running = false, dirty = true;
+function loop(){
+  if (!running) return;
+  if (simAlpha > 0.021) { tick(); tick(); dirty = true; }
+  
+  if (dirty) render();
+  requestAnimationFrame(loop);
+}
+
+/* ---------------- interaction ---------------- */
+function toWorld(px, py){
+  return { x: (px - (RAIL + W)/2 - view.x)/view.k, y: (py - H/2 - view.y)/view.k };
+}
+function pick(px, py){
+  const p = toWorld(px, py);
+  let best = null, bd = 1e9;
+  nodes.forEach(n => {
+    if (!visible(n)) return;
+    const d = Math.hypot(n.x-p.x, n.y-p.y);
+    if (d < n.r + 6/view.k && d < bd){ bd = d; best = n; }
+  });
+  return best;
+}
+function fit(){
+  if (!nodes.length) return;
+  const shown = nodes.filter(visible);
+  const src = shown.length ? shown : nodes;
+  const xs = src.map(n=>n.x), ys = src.map(n=>n.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = Math.max(1, maxX-minX), h = Math.max(1, maxY-minY);
+  const availW = Math.max(240, W - RAIL - 80), availH = Math.max(240, H - 120);
+  view.k = Math.max(0.15, Math.min(1.1, Math.min(availW/w, availH/h)));
+  view.x = -view.k * (minX+maxX)/2;
+  view.y = -view.k * (minY+maxY)/2;
+  dirty = true;
+}
+
+function bind(){
+  let dragging = null, panning = false, last = null, moved = 0;
+  canvas.addEventListener('mousedown', ev => {
+    const n = pick(ev.offsetX, ev.offsetY);
+    moved = 0; last = {x:ev.offsetX, y:ev.offsetY};
+    if (n){ dragging = n; simAlpha = Math.max(simAlpha, .35); }
+    else { panning = true; canvas.classList.add('grabbing'); }
+  });
+  window.addEventListener('mousemove', ev => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX-rect.left, y = ev.clientY-rect.top;
+    if (dragging){
+      const w = toWorld(x, y); dragging.x = w.x; dragging.y = w.y;
+      dragging.vx = dragging.vy = 0; simAlpha = Math.max(simAlpha, .3); moved += 5;
+    } else if (panning && last){
+      view.x += x-last.x; view.y += y-last.y; last = {x,y}; moved += 5;
+    } else {
+      const h = pick(x,y);
+      if ((h&&h.id)!==(hovered&&hovered.id)){ hovered = h; canvas.style.cursor = h?'pointer':'grab'; }
+    }
+  });
+  window.addEventListener('mouseup', ev => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX-rect.left, y = ev.clientY-rect.top;
+    if (dragging && moved < 6) select(dragging.id);
+    else if (panning && moved < 6){ const h = pick(x,y); if (h) select(h.id); else closePanel(); }
+    dragging = null; panning = false; canvas.classList.remove('grabbing');
+  });
+  canvas.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX-rect.left - W/2, my = ev.clientY-rect.top - H/2;
+    const k0 = view.k;
+    const k1 = Math.min(4, Math.max(0.15, view.k * (ev.deltaY < 0 ? 1.12 : 0.89)));
+    view.x = mx - (mx - view.x) * (k1/k0);
+    view.y = my - (my - view.y) * (k1/k0);
+    view.k = k1;
+  }, {passive:false});
+  canvas.addEventListener('dblclick', ev => { const n = pick(ev.offsetX, ev.offsetY); if (n) focusNode(n); });
+  window.addEventListener('resize', () => { resize(); render(); });
+  window.addEventListener('keydown', ev => {
+    if (ev.key === '/' && document.activeElement !== document.getElementById('q')){
+      ev.preventDefault(); document.getElementById('q').focus();
+    } else if (ev.key === 'Escape'){
+      document.getElementById('q').value=''; query=''; document.getElementById('q').blur(); closePanel(); updateMeta();
+    }
+  });
+}
+
+function focusNode(n){
+  view.k = Math.min(2.2, Math.max(1.2, view.k));
+  view.x = -n.x*view.k; view.y = -n.y*view.k;
+}
+
+/* ---------------- detail panel ---------------- */
+function select(id){
+  selected = byId.get(id) || null;
+  if (!selected) return;
+  document.getElementById('panel').classList.add('open');
+  document.getElementById('ptitle').textContent = selected.title;
+  const d = new Date((selected.created_at||0)*1000);
+  const date = isNaN(d) ? '' : d.toLocaleDateString('zh-CN');
+  const rels = edges.filter(e => e.source===id || e.target===id).map(e => {
+    const other = e.source===id ? e.target : e.source;
+    const o = byId.get(other); if (!o) return '';
+    return `<div class="lk" data-id="${o.id}"><span class="rel">${esc(e.rel)}</span>
+      <span class="nm" style="color:${KIND_COLOR[o.kind]||'#94a3b8'}">${esc(o.title)}</span></div>`;
+  }).join('') || '<div class="empty">无关联</div>';
+  document.getElementById('pbody').innerHTML = `
+    <div class="kv"><span>类型 <i>${esc(selected.kind)}</i></span>
+      <span>项目 <i>${esc(selected.project||'—')}</i></span>
+      <span>${esc(date)}</span>
+      <span>显著度 <i>${(selected.salience||0).toFixed(2)}</i></span>
+      <span>连接 <i>${selected.deg||0}</i></span>
+      ${selected.status && selected.status!=='active' ? `<span style="color:#ef4444">${esc(selected.status)}</span>`:''}
+    </div>
+    <div>${(selected.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}</div>
+    <div class="body">${esc(selected.preview || '')}</div>
+    <div class="section-title" style="margin-bottom:6px">关联 (${edges.filter(e=>e.source===id||e.target===id).length})</div>
+    <div class="links">${rels}</div>`;
+  document.querySelectorAll('#pbody .lk').forEach(el => {
+    el.addEventListener('click', () => select(el.dataset.id));
+  });
+  render();
+}
+function closePanel(){
+  document.getElementById('panel').classList.remove('open');
+  selected = null; render();
+}
+
+/* ---------------- meta / filters ---------------- */
+function updateMeta(){
+  const vis = nodes.filter(visible).length;
+  const m = DATA.meta || {};
+  document.getElementById('meta').innerHTML =
+    `<b>${vis}</b> / ${nodes.length} 节点 · <b>${edges.length}</b> 条关联<br>` +
+    `生成 ${m.generated ? new Date(m.generated*1000).toLocaleString('zh-CN') : '—'}<br>` +
+    `数据 <code>~/.dsh/memory/memory.db</code>`;
+  document.getElementById('qhint').textContent = query
+    ? `匹配 ${vis} 个节点` : '点击节点看详情 · 拖拽布局 · 滚轮缩放';
+}
+
+function chips(){
+  const box = document.getElementById('kinds');
+  const counts = {};
+  nodes.forEach(n => counts[n.kind] = (counts[n.kind]||0)+1);
+  box.innerHTML = Object.keys(KIND_COLOR).filter(k => counts[k]).map(k =>
+    `<span class="chip ${activeKinds.has(k)?'on':'off'}" data-k="${k}">
+       <span class="sw" style="background:${KIND_COLOR[k]}"></span>${k} ${counts[k]}</span>`).join('');
+  box.querySelectorAll('.chip').forEach(el => el.addEventListener('click', () => {
+    const k = el.dataset.k;
+    if (activeKinds.has(k)) activeKinds.delete(k); else activeKinds.add(k);
+    el.classList.toggle('on'); el.classList.toggle('off'); updateMeta(); render();
+  }));
+}
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast._t); toast._t = setTimeout(()=>t.classList.remove('show'), 1600);
+}
+
+/* ---------------- settings ---------------- */
+const LIVE = location.protocol.startsWith('http');
+
+async function api(path, body){
+  const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {};
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+function fillSettings(st){
+  const s = st.settings || st;
+  const llm = s.llm || {};
+  document.getElementById('s-base').value = llm.base || '';
+  document.getElementById('s-model').value = llm.model || '';
+  document.getElementById('s-keyhint').textContent = llm.configured ? '已配置' : '未配置';
+  const mt = s.maintenance || {};
+  document.getElementById('s-auto').value = mt.auto ? '1' : '0';
+  document.getElementById('s-interval').value = String(mt.interval_minutes || 30);
+  const ex = s.exclude || {};
+  document.getElementById('s-xprojects').value = (ex.projects||[]).join('\n');
+  document.getElementById('s-xpaths').value = (ex.paths||[]).join('\n');
+  document.getElementById('s-xkeywords').value = (ex.keywords||[]).join('\n');
+  const last = mt.last_run ? new Date(mt.last_run*1000).toLocaleString('zh-CN') : '从未';
+  const as = st.autostart || {};
+  const set = document.getElementById('s-status');
+  if (set) set.innerHTML = `记忆 <b>${st.total ?? '—'}</b> 条 · 关系 <b>${st.links ?? '—'}</b> 条 · ` +
+    `上次维护 <b>${last}</b><br>后台任务：<b>${as.enabled ? '运行中（每 ' + Math.round((as.interval_seconds||0)/60) + ' 分钟）' : '未启用'}</b>`;
+}
+
+async function openSettings(){
+  document.getElementById('modal').classList.add('open');
+  document.getElementById('ro').style.display = LIVE ? 'none' : 'block';
+  if (!LIVE){ fillSettings(EMBEDDED); return; }
+  try {
+    const st = await api('/api/stats');
+    fillSettings(st);
+  } catch(e){ toast('读取设置失败：' + e.message); }
+}
+
+function lines(id){
+  return document.getElementById(id).value.split('\n').map(x=>x.trim()).filter(Boolean);
+}
+
+async function saveSettings(){
+  const payload = {
+    llm: {
+      base: document.getElementById('s-base').value.trim(),
+      model: document.getElementById('s-model').value.trim()
+    },
+    maintenance: {
+      auto: document.getElementById('s-auto').value === '1',
+      interval_minutes: parseInt(document.getElementById('s-interval').value, 10)
+    },
+    exclude: { projects: lines('s-xprojects'), paths: lines('s-xpaths'), keywords: lines('s-xkeywords') }
+  };
+  const key = document.getElementById('s-key').value.trim();
+  if (key) payload.llm.key = key;
+  try {
+    const r = await api('/api/settings', payload);
+    document.getElementById('s-key').value = '';
+    toast('已保存' + (r.autostart && r.autostart.enabled ? ' · 后台维护已启用' : ''));
+    const st = await api('/api/stats');
+    fillSettings(st);
+  } catch(e){ toast('保存失败：' + e.message); }
+}
+
+async function action(name, label){
+  try {
+    toast(label + '…');
+    const r = await api('/api/action', {name});
+    toast(label + '完成：' + JSON.stringify(r.result).slice(0, 90));
+    const st = await api('/api/stats'); fillSettings(st);
+    await load(); chips(); updateMeta(); render();
+  } catch(e){ toast(label + '失败：' + e.message); }
+}
+
+/* ---------------- boot ---------------- */
+async function boot(){
+  canvas = document.getElementById('cv');
+  ctx = canvas.getContext('2d');
+  resize();
+  await load();
+  chips(); bind();
+  let fitTimer = null;
+  document.getElementById('q').addEventListener('input', ev => {
+    query = ev.target.value.trim(); updateMeta();
+    clearTimeout(fitTimer); fitTimer = setTimeout(() => { fit(); render(); }, 180);
+  });
+  document.getElementById('proj').addEventListener('change', ev => {
+    project = ev.target.value; updateMeta(); fit(); render();
+  });
+  document.getElementById('fit').addEventListener('click', () => { fit(); render(); });
+  document.getElementById('relayout').addEventListener('click', () => {
+    nodes.forEach(n => { n.x=(Math.random()-.5)*600; n.y=(Math.random()-.5)*600; n.vx=n.vy=0; });
+    simAlpha = 1; render(); toast('重新布局');
+  });
+  document.getElementById('labels').addEventListener('click', ev => {
+    showLabels = !showLabels; ev.target.textContent = '标签：' + (showLabels?'开':'关'); render();
+  });
+  document.getElementById('retired').addEventListener('click', ev => {
+    showRetired = !showRetired; ev.target.textContent = showRetired?'隐藏失效':'含失效';
+    load().then(()=>{chips(); updateMeta(); render();});
+  });
+  document.getElementById('pclose').addEventListener('click', closePanel);
+  document.getElementById('gear').addEventListener('click', openSettings);
+  document.getElementById('s-close').addEventListener('click', () => document.getElementById('modal').classList.remove('open'));
+  document.getElementById('modal').addEventListener('click', ev => {
+    if (ev.target.id === 'modal') document.getElementById('modal').classList.remove('open');
+  });
+  document.getElementById('s-save').addEventListener('click', saveSettings);
+  document.getElementById('act-maintain').addEventListener('click', () => action('maintain', '维护'));
+  document.getElementById('act-relink').addEventListener('click', () => action('relink', '重建边'));
+  document.getElementById('act-reindex').addEventListener('click', () => action('reindex', '重建索引'));
+  document.getElementById('act-export').addEventListener('click', () => action('export', '导出'));
+  if (!LIVE){
+    ['s-save','act-maintain','act-relink','act-reindex','act-export'].forEach(id => {
+      const el = document.getElementById(id); if (el) el.disabled = true;
+    });
+  }
+  window.__mem = { select, fit, get data(){ return DATA; } };
+  running = true; loop();
+  updateMeta();
+}
+boot();
+</script>
+</body>
+</html>

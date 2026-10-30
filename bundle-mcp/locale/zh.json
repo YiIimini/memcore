@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "本地记忆库（MCP）",
+    "description": "把本地长期记忆暴露为 memory_search / memory_add / memory_brief / memory_recall / memory_get / memory_stats 工具。"
+  }
+}
