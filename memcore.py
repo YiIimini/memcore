@@ -339,7 +339,18 @@ class Memory:
             cfg["llm"]["key"] = key
         return cfg
 
-    def _llm_key(self) -> str:
+    def _llm_key(self, base: str = "") -> str:
+        """Local gateway keys come from the Harness itself; external bases use the stored key."""
+        local = (base or (self.cfg.get("llm", {}) or {}).get("base", "")).startswith("http://127.0.0.1")
+        gw = os.path.expanduser("~/.dsh/openai-gateway/api-key")
+        if local:
+            try:
+                with open(gw, "r", encoding="utf-8") as fh:
+                    k = fh.read().strip()
+                if k:
+                    return k
+            except Exception:
+                pass
         if os.environ.get("MEM_LLM_KEY"):
             return os.environ["MEM_LLM_KEY"]
         try:
@@ -1296,7 +1307,7 @@ class Memory:
         cfg = self.cfg.get("llm", {}) or {}
         base = (os.environ.get("MEM_LLM_BASE") or cfg.get("base")
                 or "https://api.deepseek.com/v1").rstrip("/")
-        key = os.environ.get("MEM_LLM_KEY") or self._llm_key()
+        key = os.environ.get("MEM_LLM_KEY") or self._llm_key(base)
         model = os.environ.get("MEM_LLM_MODEL") or cfg.get("model") or "deepseek-flash"
         if not key:
             return None, "no MEM_LLM_KEY/DEEPSEEK_API_KEY"
@@ -1329,7 +1340,7 @@ class Memory:
         import urllib.request
         cfg = self.cfg.get("llm", {}) or {}
         base = (base or cfg.get("base") or "https://api.deepseek.com/v1").rstrip("/")
-        key = key or self._llm_key()
+        key = key or self._llm_key(base)
         model = model or cfg.get("model") or "deepseek-flash"
         if not key:
             return {"ok": False, "error": "未配置 API Key", "models": []}

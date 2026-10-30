@@ -641,8 +641,13 @@ function fillSettings(st){
   document.getElementById('s-model').value = llm.model || '';
   document.getElementById('s-keyhint').textContent = llm.configured ? '已配置' : '未配置';
   const gw = document.getElementById('s-gw');
-  if (gw) gw.textContent = /127\.0\.0\.1/.test(llm.base || '')
-    ? '· 本机网关（无需填 Key）' : '· 外部 API（需要 Key）';
+  const local = /127\.0\.0\.1/.test(llm.base || '');
+  if (gw) gw.textContent = local ? '· 本机网关（无需填 Key）' : '· 外部 API（需要 Key）';
+  const keyEl = document.getElementById('s-key');
+  if (keyEl){
+    keyEl.disabled = local;
+    keyEl.placeholder = local ? '本机网关自动鉴权，无需填写' : 'sk-...（留空表示不修改）';
+  }
   const mt = s.maintenance || {};
   document.getElementById('s-auto').value = mt.auto ? '1' : '0';
   document.getElementById('s-interval').value = String(mt.interval_minutes || 30);
