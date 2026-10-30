@@ -168,6 +168,13 @@ $M stats --json
 
 ## 10. 可视化（Obsidian 风格关系图 + 设置面板）
 
+**常驻入口（不需要终端）**
+
+- 双击桌面 **“记忆面板”**，或浏览器打开 **http://127.0.0.1:8790/**
+- 由 launchd `com.memcore.ui` 常驻（`RunAtLoad` + `KeepAlive`），开机自起；
+  端口被占会自动顺延到 8791–8799 并在 `~/.dsh/memory/ui-server.log` 记一行
+- 应用副本在 `~/Applications/记忆面板.app`（可拖进 Dock）
+
 ```bash
 mem ui                      # 生成 ~/.dsh/memory/graph.html（单文件，双击即开，数据内嵌）
 mem ui --out ~/Desktop/mem.html --limit 1500

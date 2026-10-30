@@ -14,6 +14,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TPL = os.path.join(HERE, "ui", "index.html")
 
 
+def _bind(port: int, handler):
+    """Bind the requested port, or the next few if it is taken (boot-time safety)."""
+    last = None
+    for p in [port] + [port + i for i in range(1, 10)]:
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", p), handler), p
+        except OSError as e:
+            last = e
+    raise last
+
+
 def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
     home = mem.home
 
@@ -134,7 +145,7 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
             finally:
                 m.close()
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd, port = _bind(port, Handler)
     url = "http://127.0.0.1:%d/" % port
     print("memory graph: %s  (Ctrl-C 退出)" % url)
     if open_browser:
