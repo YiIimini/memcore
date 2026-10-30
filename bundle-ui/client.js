@@ -20,10 +20,26 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         let alive = true;
         (async () => {
+          const pickBg = () => {
+            let el = document.body;
+            while (el) {
+              const c = getComputedStyle(el).backgroundColor;
+              if (c && c !== 'transparent' && !/rgba\(.*,\s*0\)$/.test(c)) return c;
+              el = el.parentElement;
+            }
+            return '';
+          };
+          const bg = pickBg();
+          const fg = getComputedStyle(document.body).color || '';
+          const rgb = (bg.match(/\d+/g) || []).slice(0, 3).map(Number);
+          const dark = rgb.length === 3 ? (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) < 128
+                                        : matchMedia('(prefers-color-scheme: dark)').matches;
+          const q = '&bg=' + encodeURIComponent(bg || (dark ? '#181818' : '#ffffff')) +
+                    '&fg=' + encodeURIComponent(fg || (dark ? '#F2F2F4' : '#18181B'));
           for (const p of PORTS) {
             try {
               const r = await fetch('http://127.0.0.1:' + p + '/api/graph?limit=1');
-              if (r.ok) { if (alive) setSrc('http://127.0.0.1:' + p + '/?embed=1'); return; }
+              if (r.ok) { if (alive) setSrc('http://127.0.0.1:' + p + '/?embed=1' + q); return; }
             } catch (e) { /* next port */ }
           }
           if (alive) setFailed(true);
