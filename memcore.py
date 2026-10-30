@@ -417,6 +417,45 @@ class Memory:
                 return True
         return False
 
+    def backup(self, keep: int = 7) -> str:
+        """Consistent SQLite snapshot into backups/, keeping the newest `keep` files."""
+        bdir = os.path.join(self.home, "backups")
+        os.makedirs(bdir, exist_ok=True)
+        dest = os.path.join(bdir, "memory-%s.db" % time.strftime("%Y%m%d"))
+        tmp = dest + ".tmp"
+        try:
+            with sqlite3.connect(tmp) as tgt:
+                self.db.backup(tgt)
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return ""
+        old = sorted(f for f in os.listdir(bdir) if f.startswith("memory-") and f.endswith(".db"))
+        for f in old[:-keep]:
+            try:
+                os.remove(os.path.join(bdir, f))
+            except OSError:
+                pass
+        return dest
+
+    def _rotate(self) -> None:
+        """Keep the append-only journal bounded and the session cache small."""
+        try:
+            if os.path.getsize(self.journal_path) > 5 * 1024 * 1024:
+                os.replace(self.journal_path, self.journal_path + ".1")
+        except OSError:
+            pass
+        try:
+            files = [os.path.join(self.cache_dir, f) for f in os.listdir(self.cache_dir) if f.endswith(".jsonl")]
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for p in files[20:]:
+                os.remove(p)
+        except OSError:
+            pass
+
     def maintain(self) -> Dict[str, Any]:
         """One-shot routine: ingest new sessions, add edges, gc, rebuild mirror."""
         ing = self.ingest_sessions()
@@ -430,13 +469,17 @@ class Memory:
             self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
+        self._rotate()
+        backup = self.backup()
         self.cfg.setdefault("maintenance", {})["last_run"] = now()
         try:
             with open(self.config_path, "w", encoding="utf-8") as fh:
                 json.dump(self.cfg, fh, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        return {"ingest": ing, "new_edges": edges, "gc": g["removed"], "total": self.stats()["total"]}
+        return {"ingest": ing, "new_edges": edges, "gc": g["removed"],
+                "backup": os.path.basename(backup) if backup else "",
+                "total": self.stats()["total"]}
 
     def _meta_init(self) -> None:
         cur = self.db.execute("SELECT v FROM meta WHERE k='schema'").fetchone()

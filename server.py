@@ -45,13 +45,28 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
         def log_message(self, fmt, *args):  # keep the console quiet
             pass
 
+        def _cors(self):
+            origin = self.headers.get("Origin") or ""
+            local = origin.startswith("http://127.0.0.1") or origin.startswith("http://localhost")
+            self.send_header("Access-Control-Allow-Origin", origin if local else "*")
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
         def _send(self, code, body: bytes, ctype="application/json; charset=utf-8"):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._cors()
             self.end_headers()
             self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, ensure_ascii=False).encode())
@@ -68,6 +83,10 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                 return {}
 
         def do_POST(self):
+            origin = self.headers.get("Origin") or ""
+            if origin and not (origin.startswith("http://127.0.0.1") or origin.startswith("http://localhost")):
+                self._json({"error": "cross-origin write refused"}, 403)
+                return
             u = urllib.parse.urlparse(self.path)
             payload = self._body()
             m = db()
