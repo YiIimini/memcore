@@ -187,7 +187,9 @@ mem serve --port 8787 --open # 实时版：读活库 + JSON API
 - `GET /api/graph|/api/memory/<id>|/api/search|/api/stats` 可直接被别的界面复用。
 - 实现：单文件 HTML + Canvas 2D，无任何外部依赖/CDN，`file://` 也能跑。
 - **右上角 ⚙ 设置面板**（`mem serve` 打开时可用，`file://` 为只读）：
-  - 大模型裁判：Base URL / Model / API Key（密钥写 `secrets.json` 0600，不回显，只显示"已配置"）
+  - 大模型裁判：默认走 Harness 本机网关 `http://127.0.0.1:8326/v1`（模型列表实时拉取，当前
+    `deepseek-account/deepseek-flash`），**不需要填 Key**；要接外部 API 再填 Base/Key
+  - 「测试连接」一键验证并列出可用模型；模型输入带 datalist 补全
   - 自动维护：开关 + 间隔（15/30/60/180 分钟），落盘为 launchd `com.memcore.maintain`
   - 隐私排除：项目名 / 路径前缀 / 关键词，命中即不灌入、不检索
   - 一键动作：立即维护、重建关系边、重建索引、导出 MEMORY.md

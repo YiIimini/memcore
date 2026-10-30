@@ -57,7 +57,7 @@ KIND_DEFAULTS = {
 KINDS = tuple(KIND_DEFAULTS)
 
 DEFAULT_CONFIG = {
-    "version": 3,
+    "version": 5,
     "weights": {          # validated on the real store (12/12 paraphrase queries)
         "lexical": 0.50,
         "semantic": 0.22,
@@ -77,7 +77,8 @@ DEFAULT_CONFIG = {
     "consolidate": {"dup_sim": 0.93, "conflict_sim": 0.74},
     "maintenance": {"auto": False, "interval_minutes": 30, "last_run": 0},
     "exclude": {"projects": [], "paths": [], "keywords": []},
-    "llm": {"base": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    "llm": {"base": "http://127.0.0.1:8326/v1", "model": "deepseek-account/deepseek-flash",
+            "gateway": True},
 }
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
@@ -310,7 +311,7 @@ class Memory:
             stale = int(user.get("version", 1)) < int(DEFAULT_CONFIG["version"])
             for k, v in user.items():
                 if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                    if stale and k in ("weights", "consolidate", "autolink"):
+                    if stale and k in ("weights", "consolidate", "autolink", "llm"):
                         continue  # scoring/algorithm changes come from code, not old files
                     cfg[k].update(v)
                 else:
@@ -343,7 +344,16 @@ class Memory:
             return os.environ["MEM_LLM_KEY"]
         try:
             with open(self.secrets_path, "r", encoding="utf-8") as fh:
-                return (json.load(fh) or {}).get("MEM_LLM_KEY", "")
+                k = (json.load(fh) or {}).get("MEM_LLM_KEY", "")
+            if k:
+                return k
+        except Exception:
+            pass
+        # zero-config default: the Harness' own local OpenAI-compatible gateway
+        gw = os.path.expanduser("~/.dsh/openai-gateway/api-key")
+        try:
+            with open(gw, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
         except Exception:
             return ""
 
@@ -1287,7 +1297,7 @@ class Memory:
         base = (os.environ.get("MEM_LLM_BASE") or cfg.get("base")
                 or "https://api.deepseek.com/v1").rstrip("/")
         key = os.environ.get("MEM_LLM_KEY") or self._llm_key()
-        model = os.environ.get("MEM_LLM_MODEL") or cfg.get("model") or "deepseek-chat"
+        model = os.environ.get("MEM_LLM_MODEL") or cfg.get("model") or "deepseek-flash"
         if not key:
             return None, "no MEM_LLM_KEY/DEEPSEEK_API_KEY"
         import urllib.request
@@ -1312,6 +1322,47 @@ class Memory:
             return (json.loads(m.group(0)) if m else None), "llm"
         except Exception as e:  # noqa: BLE001
             return None, "llm error: %s" % e
+
+    def llm_probe(self, base: str = "", model: str = "", key: str = "", timeout: int = 15) -> Dict[str, Any]:
+        """Verify an OpenAI-compatible endpoint + list its model ids."""
+        import urllib.error
+        import urllib.request
+        cfg = self.cfg.get("llm", {}) or {}
+        base = (base or cfg.get("base") or "https://api.deepseek.com/v1").rstrip("/")
+        key = key or self._llm_key()
+        model = model or cfg.get("model") or "deepseek-flash"
+        if not key:
+            return {"ok": False, "error": "未配置 API Key", "models": []}
+        bases = [base]
+        if re.match(r"^http://127\.0\.0\.1:\d+", base or ""):
+            port = int(re.search(r":(\d+)", base).group(1))
+            bases += ["http://127.0.0.1:%d/v1" % p for p in range(port + 1, port + 6)]
+        for b in bases:
+            out = self._probe_one(b, key, model, timeout)
+            if out.get("ok") or "HTTP 4" in str(out.get("error")):
+                out["base"] = b
+                return out
+        return self._probe_one(base, key, model, timeout)
+
+    def _probe_one(self, base: str, key: str, model: str, timeout: int = 15) -> Dict[str, Any]:
+        import urllib.error
+        import urllib.request
+        try:
+            req = urllib.request.Request(base + "/models", headers={"Authorization": "Bearer " + key})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+            models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+            return {"ok": True, "models": models, "model": model,
+                    "model_ok": (not models) or (model in models)}
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode()[:200]
+            except Exception:
+                pass
+            return {"ok": False, "error": "HTTP %s %s" % (e.code, detail), "models": [], "model": model}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e), "models": [], "model": model}
 
     def consolidate(self, dry_run: bool = True, llm: bool = False, limit: int = 400,
                     kinds: Sequence[str] = ("fact", "decision", "preference", "note", "insight")) -> List[Dict[str, Any]]:

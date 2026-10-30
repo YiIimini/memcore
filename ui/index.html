@@ -58,6 +58,11 @@
   .kv i{font-style:normal;color:var(--fg)}
   .tag{display:inline-block;padding:1px 7px;border-radius:999px;background:#16213a;color:#93c5fd;font-size:10.5px;margin-right:4px}
   .body{white-space:pre-wrap;color:#cbd5e1;background:#0a0f18;border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0 14px}
+  .acts{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 12px}
+  .acts button{padding:5px 10px;border-radius:7px;border:1px solid var(--line);background:#0d1524;color:var(--fg);
+    font-size:11.5px;cursor:pointer}
+  .acts button:hover{border-color:#3b4a63;background:#141d2e}
+  .acts button.danger:hover{border-color:#7f1d1d;color:#fca5a5}
   .links .lk{display:flex;gap:6px;align-items:baseline;padding:5px 0;border-bottom:1px dashed #1b2436;cursor:pointer}
   .links .lk:hover{color:var(--accent)}
   .lk .rel{font-size:10px;color:var(--dim);min-width:74px}
@@ -139,13 +144,20 @@
     <div class="sub">配置存在 <code>~/.dsh/memory/config.json</code>，密钥写 <code>secrets.json</code>（0600，不回显）</div>
     <div id="ro" class="readonly" style="display:none">只读模式：请用 <code>mem serve</code> 打开本页再保存设置。</div>
 
-    <h3>大模型裁判（可选）</h3>
+    <h3>大模型裁判 <span class="hint" id="s-gw"></span></h3>
     <div class="row2">
       <div class="field"><label>Base URL</label><input id="s-base" placeholder="https://api.deepseek.com/v1"></div>
-      <div class="field"><label>Model</label><input id="s-model" placeholder="deepseek-chat"></div>
+      <div class="field"><label>Model</label>
+        <input id="s-model" list="modelopts" placeholder="deepseek-account/deepseek-flash">
+        <datalist id="modelopts">
+          <option value="deepseek-account/deepseek-flash"></option>
+          <option value="deepseek-account/deepseek-v4-pro"></option>
+        </datalist></div>
     </div>
     <div class="field"><label>API Key <span id="s-keyhint" class="hint"></span></label>
       <input id="s-key" type="password" placeholder="sk-...（留空表示不修改）" autocomplete="off"></div>
+    <div class="btnrow"><button class="btn" id="act-test">测试连接</button>
+      <span id="s-test" class="hint" style="align-self:center"></span></div>
 
     <h3>自动维护</h3>
     <div class="row2">
@@ -186,11 +198,13 @@
 <script>
 const EMBEDDED = __DATA__;
 const KIND_COLOR = {
-  identity:'#f472b6', preference:'#a78bfa', decision:'#60a5fa', fact:'#34d399',
+  core:'#e8ecff', identity:'#f472b6', preference:'#a78bfa', decision:'#60a5fa', fact:'#34d399',
   project:'#fbbf24', artifact:'#fb923c', insight:'#22d3ee', episode:'#94a3b8',
   todo:'#ef4444', note:'#64748b'
 };
+const CORE_ID = '__me__';
 const REL_STYLE = {
+  core:{color:'#8b9dff', dash:[], w:1},
   related:{color:'#3b82f6', dash:[], w:1},
   supersedes:{color:'#ef4444', dash:[5,4], w:1.4},
   documents:{color:'#a78bfa', dash:[2,3], w:1},
@@ -227,6 +241,14 @@ async function load(){
 }
 
 function build(){
+  const raw = (DATA.nodes || []).filter(n => n.id !== CORE_ID);
+  const core = {
+    id: CORE_ID, title: '我', kind: 'core', project: '', tags: ['core'],
+    salience: 1, pinned: true, status: 'active', created_at: Math.floor(Date.now()/1000),
+    valid_to: 0, degree: raw.length, preview: '记忆核心：所有记忆都属于你、围绕你组织。'
+  };
+  DATA.nodes = [core].concat(raw);
+  DATA.edges = (DATA.edges || []).concat(raw.map(n => ({source: CORE_ID, target: n.id, rel: 'core', w: 0.25})));
   nodes = DATA.nodes.map(n => Object.assign({}, n, {
     x: (Math.random()-.5)*600, y:(Math.random()-.5)*600, vx:0, vy:0, r:6
   }));
@@ -237,7 +259,8 @@ function build(){
   edges.forEach(e => { deg.set(e.source,(deg.get(e.source)||0)+1); deg.set(e.target,(deg.get(e.target)||0)+1); });
   nodes.forEach(n => {
     n.deg = deg.get(n.id) || 0;
-    n.r = 4 + Math.sqrt(n.deg)*1.9 + (n.salience||0)*4.2;
+    n.r = n.id === CORE_ID ? 22 : (4 + Math.sqrt(n.deg)*1.9 + (n.salience||0)*4.2);
+    if (n.id === CORE_ID) { n.x = 0; n.y = 0; n.fixed = true; }
   });
   fillProjects();
   // settle synchronously so the first frame is already a readable layout
@@ -305,6 +328,7 @@ function resize(){
 }
 
 function visible(n){
+  if (n.id === CORE_ID) return true;
   if (!activeKinds.has(n.kind)) return false;
   if (project && n.project !== project) return false;
   if (!showRetired && n.status && n.status !== 'active') return false;
@@ -357,14 +381,26 @@ function render(){
       ctx.strokeStyle = col; ctx.globalAlpha = (lit?0.6:0.22);
       ctx.lineWidth = 1.6/view.k; ctx.stroke(); ctx.globalAlpha = lit ? 1 : 0.3;
     }
+    if (n.id === CORE_ID){
+      const g = ctx.createRadialGradient(n.x, n.y, 2, n.x, n.y, n.r*2.6);
+      g.addColorStop(0, 'rgba(190,205,255,.95)');
+      g.addColorStop(.45, 'rgba(120,145,255,.35)');
+      g.addColorStop(1, 'rgba(120,145,255,0)');
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r*2.6, 0, Math.PI*2);
+      ctx.fillStyle = g; ctx.fill();
+    }
     ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
-    ctx.fillStyle = retired ? '#0b0f17' : col;
+    ctx.fillStyle = retired ? '#0b0f17' : (n.id === CORE_ID ? '#dfe6ff' : col);
     ctx.fill();
     ctx.lineWidth = 1.4/view.k;
     ctx.strokeStyle = retired ? col : 'rgba(0,0,0,.35)';
     ctx.stroke();
 
-    if (showLabels && (n.id === focus || n.deg >= 6 || (view.k > 0.85 && n.deg >= 3))){
+    if (n.id === CORE_ID){
+      ctx.font = `${Math.max(12, 13/view.k)}px -apple-system,"PingFang SC",sans-serif`;
+      ctx.fillStyle = '#eef2ff'; ctx.globalAlpha = 0.95;
+      ctx.fillText('我 · 核心', n.x + n.r + 8/view.k, n.y + 5/view.k);
+    } else if (showLabels && (n.id === focus || n.deg >= 6 || (view.k > 0.85 && n.deg >= 3))){
       const fs = Math.max(10/view.k, 9.5/view.k + 1.5/view.k);
       ctx.font = `${fs}px -apple-system,"PingFang SC",sans-serif`;
       ctx.fillStyle = lit ? '#e5e7eb' : '#475569';
@@ -419,6 +455,7 @@ function bind(){
   canvas.addEventListener('mousedown', ev => {
     const n = pick(ev.offsetX, ev.offsetY);
     moved = 0; last = {x:ev.offsetX, y:ev.offsetY};
+    if (n && n.fixed){ select(n.id); return; }
     if (n){ dragging = n; simAlpha = Math.max(simAlpha, .35); }
     else { panning = true; canvas.classList.add('grabbing'); }
   });
@@ -482,6 +519,35 @@ function select(id){
     return `<div class="lk" data-id="${o.id}"><span class="rel">${esc(e.rel)}</span>
       <span class="nm" style="color:${KIND_COLOR[o.kind]||'#94a3b8'}">${esc(o.title)}</span></div>`;
   }).join('') || '<div class="empty">无关联</div>';
+  if (id === CORE_ID){
+    const total = nodes.length - 1;
+    const kinds = {};
+    nodes.forEach(n => { if (n.id !== CORE_ID) kinds[n.kind] = (kinds[n.kind]||0)+1; });
+    const hubs = nodes.filter(n => n.id !== CORE_ID).sort((a,b)=>b.deg-a.deg).slice(0,6);
+    document.getElementById('pbody').innerHTML = `
+      <div class="kv"><span>记忆核心</span><span>共 <i>${total}</i> 条记忆</span>
+        <span>关系 <i>${edges.filter(e=>e.rel!=='core').length}</i></span></div>
+      <div class="body">这是你。所有记忆都是你的外延：每条记忆都有一条线连回这里，
+别的节点按类型、显著度和关联度围绕你分布。</div>
+      <div class="section-title" style="margin:6px 0 6px">类型分布</div>
+      <div>${Object.keys(kinds).sort((a,b)=>kinds[b]-kinds[a]).map(k=>
+        `<span class="tag" style="color:${KIND_COLOR[k]||'#94a3b8'}">${esc(k)} ${kinds[k]}</span>`).join('')}</div>
+      <div class="section-title" style="margin:12px 0 6px">连接最多的记忆</div>
+      <div class="links">${hubs.map(h=>`<div class="lk" data-id="${h.id}">
+        <span class="rel">${h.deg} 条</span>
+        <span class="nm" style="color:${KIND_COLOR[h.kind]||'#94a3b8'}">${esc(h.title)}</span></div>`).join('')}</div>`;
+    document.querySelectorAll('#pbody .lk').forEach(el => el.addEventListener('click', () => select(el.dataset.id)));
+    render();
+    return;
+  }
+  const status = selected.status && selected.status !== 'active' ? selected.status : 'active';
+  const acts = `
+    <div class="acts">
+      <button data-act="${selected.pinned ? 'unpin' : 'pin'}">${selected.pinned ? '取消置顶' : '置顶'}</button>
+      <button data-act="retire" ${status !== 'active' ? 'disabled' : ''}>标记失效</button>
+      <button data-act="forget" class="danger">删除</button>
+      <button data-act="copy">复制 ID</button>
+    </div>`;
   document.getElementById('pbody').innerHTML = `
     <div class="kv"><span>类型 <i>${esc(selected.kind)}</i></span>
       <span>项目 <i>${esc(selected.project||'—')}</i></span>
@@ -490,12 +556,32 @@ function select(id){
       <span>连接 <i>${selected.deg||0}</i></span>
       ${selected.status && selected.status!=='active' ? `<span style="color:#ef4444">${esc(selected.status)}</span>`:''}
     </div>
+    ${acts}
     <div>${(selected.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}</div>
     <div class="body">${esc(selected.preview || '')}</div>
     <div class="section-title" style="margin-bottom:6px">关联 (${edges.filter(e=>e.source===id||e.target===id).length})</div>
     <div class="links">${rels}</div>`;
   document.querySelectorAll('#pbody .lk').forEach(el => {
     el.addEventListener('click', () => select(el.dataset.id));
+  });
+  document.querySelectorAll('#pbody .acts button').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const act = btn.dataset.act;
+      if (act === 'copy'){
+        try { await navigator.clipboard.writeText(selected.id); toast('已复制 ' + selected.id); }
+        catch(e){ toast(selected.id); }
+        return;
+      }
+      if (act === 'forget' && !confirm('删除 ' + selected.id + ' ？此操作不可恢复')){
+        return;
+      }
+      try {
+        await api('/api/action', {name: act, id: selected.id});
+        toast(({pin:'已置顶', unpin:'已取消置顶', retire:'已标记失效', forget:'已删除'})[act] || '完成');
+        closePanel();
+        await load(); chips(); updateMeta(); render();
+      } catch(e){ toast('操作失败：' + e.message); }
+    });
   });
   render();
 }
@@ -554,6 +640,9 @@ function fillSettings(st){
   document.getElementById('s-base').value = llm.base || '';
   document.getElementById('s-model').value = llm.model || '';
   document.getElementById('s-keyhint').textContent = llm.configured ? '已配置' : '未配置';
+  const gw = document.getElementById('s-gw');
+  if (gw) gw.textContent = /127\.0\.0\.1/.test(llm.base || '')
+    ? '· 本机网关（无需填 Key）' : '· 外部 API（需要 Key）';
   const mt = s.maintenance || {};
   document.getElementById('s-auto').value = mt.auto ? '1' : '0';
   document.getElementById('s-interval').value = String(mt.interval_minutes || 30);
@@ -580,6 +669,14 @@ async function openSettings(){
   try {
     const st = await api('/api/stats');
     fillSettings(st);
+    api('/api/models').then(m => {
+      if (m && m.models && m.models.length){
+        document.getElementById('modelopts').innerHTML =
+          m.models.map(x => `<option value="${esc(x)}"></option>`).join('');
+      }
+      const el = document.getElementById('s-test');
+      if (el) el.textContent = m && m.ok ? `连接正常 · ${(m.models||[]).length} 个模型可用` : '';
+    }).catch(()=>{});
   } catch(e){ toast('读取设置失败：' + e.message); }
 }
 
@@ -654,6 +751,29 @@ async function boot(){
     if (ev.target.id === 'modal') document.getElementById('modal').classList.remove('open');
   });
   document.getElementById('s-save').addEventListener('click', saveSettings);
+  document.getElementById('act-test').addEventListener('click', async () => {
+    const el = document.getElementById('s-test');
+    el.textContent = '测试中…';
+    try {
+      const r = await api('/api/llm/test', {
+        base: document.getElementById('s-base').value.trim(),
+        model: document.getElementById('s-model').value.trim(),
+        key: document.getElementById('s-key').value.trim()
+      });
+      if (r.ok){
+        el.innerHTML = `✅ 连接正常 · ${(r.models||[]).length} 个模型可用` +
+          (r.model_ok ? '' : ` · <span style="color:#fbbf24">当前模型 ${esc(r.model)} 不在列表里</span>`);
+        if ((r.models||[]).length){
+          document.getElementById('modelopts').innerHTML =
+            r.models.map(x => `<option value="${esc(x)}"></option>`).join('');
+        }
+        document.getElementById('s-key').value = '';
+        document.getElementById('s-keyhint').textContent = '已配置';
+      } else {
+        el.innerHTML = `<span style="color:#f87171">❌ ${esc(r.error || '失败')}</span>`;
+      }
+    } catch(e){ el.innerHTML = `<span style="color:#f87171">❌ ${esc(e.message)}</span>`; }
+  });
   document.getElementById('act-maintain').addEventListener('click', () => action('maintain', '维护'));
   document.getElementById('act-relink').addEventListener('click', () => action('relink', '重建边'));
   document.getElementById('act-reindex').addEventListener('click', () => action('reindex', '重建索引'));

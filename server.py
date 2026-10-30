@@ -72,7 +72,14 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
             payload = self._body()
             m = db()
             try:
-                if u.path == "/api/settings":
+                if u.path == "/api/llm/test":
+                    p = m.llm_probe(base=payload.get("base", ""), model=payload.get("model", ""),
+                                    key=payload.get("key", ""))
+                    if p.get("ok") and payload.get("key"):
+                        m.save_settings({"llm": {"key": payload["key"], "base": payload.get("base") or None,
+                                                 "model": payload.get("model") or None}})
+                    self._json(p)
+                elif u.path == "/api/settings":
                     out = m.save_settings(payload)
                     auto = (out.get("maintenance") or {})
                     if "auto" in payload.get("maintenance", {}):
@@ -89,6 +96,22 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                         self._json({"ok": True, "result": {"edges": m.relink(rebuild=True)}})
                     elif name == "reindex":
                         self._json({"ok": True, "result": {"reindexed": m.reindex()}})
+                    elif name in ("pin", "unpin", "retire", "forget"):
+                        mid = payload.get("id") or ""
+                        if not mid:
+                            self._json({"error": "missing id"}, 400)
+                        elif name == "pin":
+                            m.update(mid, pinned=True, salience=max(0.9, float((m.get(mid) or {}).get("salience") or 0.9)))
+                            self._json({"ok": True, "result": {"id": mid, "pinned": True}})
+                        elif name == "unpin":
+                            m.update(mid, pinned=False)
+                            self._json({"ok": True, "result": {"id": mid, "pinned": False}})
+                        elif name == "retire":
+                            m.retire(mid, reason=payload.get("reason", "面板操作"))
+                            self._json({"ok": True, "result": {"id": mid, "status": "retired"}})
+                        else:
+                            m.forget(mid)
+                            self._json({"ok": True, "result": {"id": mid, "deleted": True}})
                     elif name == "consolidate":
                         rep = m.consolidate(dry_run=not payload.get("apply"), llm=True)
                         self._json({"ok": True, "result": {"pairs": len(rep),
@@ -138,6 +161,8 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                     self._json({"agents": autostart.agents(panel_alive=True)})
                 elif u.path == "/api/settings":
                     self._json(m.settings())
+                elif u.path == "/api/models":
+                    self._json(m.llm_probe())
                 elif u.path == "/api/search":
                     q = qs.get("q", [""])[0]
                     self._json(m.search(q, limit=int(qs.get("limit", ["20"])[0])))

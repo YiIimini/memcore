@@ -67,6 +67,12 @@ $M doctor            # 自检
 $M export            # 重建 MEMORY.md 人类可读镜像
 ```
 
+## 模型 id
+
+裁判默认走 Harness 本机网关（`~/.dsh/openai-gateway`，`http://127.0.0.1:8326/v1`），
+模型 id 从 `/v1/models` 实时取（当前 `deepseek-account/deepseek-flash`）。
+**不要写死历史 id**（`deepseek-chat` 这类已下线）；面板「测试连接」会列出全部可用模型。
+
 ## 配置与维护（优先可视化）
 
 用户要改配置时，**开 `mem serve --open` 让他点 ⚙**，不要让他敲终端命令：

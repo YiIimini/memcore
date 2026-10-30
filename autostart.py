@@ -37,6 +37,17 @@ def _run(*args):
         return type("R", (), {"returncode": 1, "stdout": "", "stderr": str(e)})()
 
 
+def _loaded(label) -> bool:
+    """launchctl print is unreliable from inside another agent; list always works."""
+    r = _run("launchctl", "list")
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == label:
+                return True
+    return _run("launchctl", "print", _where(label)).returncode == 0
+
+
 def _where(label):
     return "gui/%d/%s" % (os.getuid(), label)
 
@@ -163,7 +174,7 @@ def status() -> dict:
 
 
 def ui_status() -> dict:
-    loaded = _run("launchctl", "print", _where(PANEL_LABEL)).returncode == 0
+    loaded = _loaded(PANEL_LABEL)
     port = 8790
     try:
         with open(PANEL_PLIST, "rb") as fh:
@@ -179,7 +190,7 @@ def ui_status() -> dict:
 
 
 def maintain_status() -> dict:
-    loaded = _run("launchctl", "print", _where(MAINTAIN_LABEL)).returncode == 0
+    loaded = _loaded(MAINTAIN_LABEL)
     iv = _interval(MAINTAIN_PLIST)
     last = 0
     p = os.path.join(LOG_DIR, "MemoryMaintain.log")
