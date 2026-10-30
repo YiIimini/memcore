@@ -126,12 +126,12 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                     self._json(graph(m, qs))
                 elif u.path == "/api/stats":
                     st = m.stats()
-                    st["agents"] = autostart.agents()
+                    st["agents"] = autostart.agents(panel_alive=True)
                     st["autostart"] = autostart.ui_status()
                     st["settings"] = m.settings()
                     self._json(st)
                 elif u.path == "/api/agents":
-                    self._json({"agents": autostart.agents()})
+                    self._json({"agents": autostart.agents(panel_alive=True)})
                 elif u.path == "/api/settings":
                     self._json(m.settings())
                 elif u.path == "/api/search":

@@ -192,5 +192,11 @@ def maintain_status() -> dict:
             "last_log": last, "plist": MAINTAIN_PLIST}
 
 
-def agents() -> list:
-    return [ui_status(), maintain_status()]
+def agents(panel_alive=None) -> list:
+    """panel_alive: pass True when called from inside the panel server itself
+    (avoids a self-probe that can race its own startup)."""
+    p = ui_status()
+    if panel_alive is not None:
+        p["alive"] = bool(panel_alive)
+        p["enabled"] = bool(p["loaded"] and p["alive"])
+    return [p, maintain_status()]
