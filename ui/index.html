@@ -161,6 +161,7 @@
       <button class="btn" id="act-maintain">立即维护</button>
       <button class="btn" id="act-relink">重建关系边</button>
       <button class="btn" id="act-reindex">重建索引</button>
+      <button class="btn" id="act-consolidate">查重复</button>
       <button class="btn" id="act-export">导出 MEMORY.md</button>
     </div>
 
@@ -656,9 +657,10 @@ async function boot(){
   document.getElementById('act-maintain').addEventListener('click', () => action('maintain', '维护'));
   document.getElementById('act-relink').addEventListener('click', () => action('relink', '重建边'));
   document.getElementById('act-reindex').addEventListener('click', () => action('reindex', '重建索引'));
+  document.getElementById('act-consolidate').addEventListener('click', () => action('consolidate', '查重复'));
   document.getElementById('act-export').addEventListener('click', () => action('export', '导出'));
   if (!LIVE){
-    ['s-save','act-maintain','act-relink','act-reindex','act-export'].forEach(id => {
+    ['s-save','act-maintain','act-relink','act-reindex','act-consolidate','act-export'].forEach(id => {
       const el = document.getElementById(id); if (el) el.disabled = true;
     });
   }

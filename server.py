@@ -89,6 +89,10 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                         self._json({"ok": True, "result": {"edges": m.relink(rebuild=True)}})
                     elif name == "reindex":
                         self._json({"ok": True, "result": {"reindexed": m.reindex()}})
+                    elif name == "consolidate":
+                        rep = m.consolidate(dry_run=not payload.get("apply"), llm=True)
+                        self._json({"ok": True, "result": {"pairs": len(rep),
+                                    "detail": rep[:5], "applied": bool(payload.get("apply"))}})
                     elif name == "export":
                         self._json({"ok": True, "result": {"path": m.export_markdown()}})
                     elif name in ("autostart_on", "autostart_off"):

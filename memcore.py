@@ -1283,9 +1283,11 @@ class Memory:
         Configured entirely by env: MEM_LLM_BASE (OpenAI-compatible), MEM_LLM_KEY,
         MEM_LLM_MODEL. Returns (decision|None, note). Never raises.
         """
-        base = os.environ.get("MEM_LLM_BASE", "https://api.deepseek.com/v1").rstrip("/")
-        key = os.environ.get("MEM_LLM_KEY") or os.environ.get("DEEPSEEK_API_KEY")
-        model = os.environ.get("MEM_LLM_MODEL", "deepseek-chat")
+        cfg = self.cfg.get("llm", {}) or {}
+        base = (os.environ.get("MEM_LLM_BASE") or cfg.get("base")
+                or "https://api.deepseek.com/v1").rstrip("/")
+        key = os.environ.get("MEM_LLM_KEY") or self._llm_key()
+        model = os.environ.get("MEM_LLM_MODEL") or cfg.get("model") or "deepseek-chat"
         if not key:
             return None, "no MEM_LLM_KEY/DEEPSEEK_API_KEY"
         import urllib.request
