@@ -1,5 +1,8 @@
 # memory-core · 我自己的长期记忆系统
 
+[![tests](https://github.com/YiIimini/memcore/actions/workflows/test.yml/badge.svg)](https://github.com/YiIimini/memcore/actions/workflows/test.yml)
+`private repo · git@github.com:YiIimini/memcore.git`
+
 单机、零依赖、可解释。给智能体用的「记忆存储 + 调用」整套工具：
 写入去重、混合检索、图谱关联、预算打包、历史会话灌入、MCP 工具暴露。
 

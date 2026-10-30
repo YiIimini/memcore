@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Engine smoke (CLI on a temp home)
+        run: |
+          export MEM_HOME="$RUNNER_TEMP/memhome"
+          ./mem add -k identity -t "ci" -b "smoke test memory" --pin
+          ./mem search "smoke" -n 1 --json | head -c 400
+          ./mem recall "smoke" --budget 200
+          ./mem brief --budget 400
