@@ -245,12 +245,26 @@ window.__ModuleLoader__.load({
       );
     }
 
+    class Boundary extends React.Component {
+      constructor(props) { super(props); this.state = { err: null }; }
+      static getDerivedStateFromError(err) { return { err }; }
+      render() {
+        if (this.state.err) {
+          return h('div', { style: { padding: 12, fontSize: 12, opacity: .85 } },
+            '记忆视图加载失败：' + String(this.state.err && this.state.err.message || this.state.err));
+        }
+        return this.props.children;
+      }
+    }
+
+    function Section() { return h(Boundary, null, h(MemorySection)); }
+
     return {
       inject: ['slots'],
       apply(ctx) {
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section', id: 'memory', order: 40, label: '记忆',
-        }, MemorySection));
+        }, Section));
       },
     };
   },
