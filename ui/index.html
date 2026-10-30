@@ -312,9 +312,11 @@ function tick(){
   // gravity + integration
   const cx = 0, cy = 0;
   nodes.forEach(n => {
-    n.vx += (cx-n.x)*0.0042; n.vy += (cy-n.y)*0.0042;
+    n.vx += (cx-n.x)*0.007; n.vy += (cy-n.y)*0.007;
     n.vx *= 0.86; n.vy *= 0.86;
     n.x += n.vx * alpha; n.y += n.vy * alpha;
+    const dist = Math.hypot(n.x, n.y), lim = 760;
+    if (dist > lim){ n.x *= lim / dist; n.y *= lim / dist; }
   });
   simAlpha = Math.max(0.004, simAlpha * 0.99);
 }
