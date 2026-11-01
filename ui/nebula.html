@@ -126,6 +126,24 @@ h1 em{font-style:normal;color:var(--gold-hi);
 #dock button:hover{color:var(--fg);background:rgba(255,255,255,.06)}
 #dock button.on{color:var(--gold-hi);background:rgba(255,197,107,.11)}
 
+/* ---------- 紧凑顶栏（小窗口 / 设置页 iframe） ---------- */
+#compact{position:fixed;z-index:11;left:0;right:0;top:0;height:44px;padding:0 12px;
+  display:none;align-items:center;gap:10px;
+  background:linear-gradient(180deg,rgba(8,13,22,.92),rgba(8,13,22,.55) 70%,transparent);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+body.compact #compact{display:flex}
+#compact .cb{display:flex;align-items:baseline;gap:8px;margin-right:auto;min-width:0}
+#compact .cb b{font-size:13px;font-weight:400;letter-spacing:.10em;
+  font-family:"Xingkai SC","STKaiti",serif;color:#DCE7F7;white-space:nowrap}
+#compact .cb span{font-size:10.5px;letter-spacing:.08em;color:var(--dim);white-space:nowrap}
+#compact .ci{width:30px;height:30px;flex:none;display:grid;place-items:center;border-radius:9px;
+  border:1px solid var(--line);background:rgba(20,30,48,.55);color:var(--muted);
+  font-size:11px;line-height:1;cursor:pointer;padding:0;transition:all .22s var(--ease)}
+#compact .ci:hover,#compact .ci.on{color:#fff;border-color:var(--line-2);background:rgba(40,58,88,.8)}
+body.compact #dock{bottom:14px;transform:translateX(-50%) scale(.9)}
+body.compact #conn{display:none}
+body.compact #loading .lt{font-size:11px}
+
 #conn{position:fixed;z-index:7;right:calc(24px + var(--rail-right, 0px));bottom:26px;font-size:10.5px;letter-spacing:.12em;
   color:var(--dim);display:flex;align-items:center;gap:7px}
 #conn::before{content:"";width:4px;height:4px;border-radius:50%;background:var(--cyan);
@@ -246,6 +264,19 @@ body.embed #conn{bottom:16px;right:16px}
   body.embed #left{width:190px}
 }
 
+
+/* ---------- 紧凑模式定位（放在最后，压过 body.embed 的默认值） ---------- */
+body.compact #compact{z-index:13}
+body.compact #left,body.compact.embed #left{
+  top:52px;bottom:52px;left:10px;width:236px;z-index:14}
+body.compact #right,body.compact.embed #right{
+  top:52px;bottom:52px;right:10px;width:272px;padding-top:12px;z-index:14}
+body.compact #left .sig,body.compact #left h1{display:none}
+body.compact #dock,body.compact.embed #dock{bottom:12px;transform:translateX(-50%) scale(.9)}
+@media (max-width:640px){
+  body.compact #left,body.compact.embed #left{width:200px}
+  body.compact #right,body.compact.embed #right{width:236px}
+}
 </style>
 </head>
 <body>
@@ -289,6 +320,13 @@ body.embed #conn{bottom:16px;right:16px}
   </div>
   <div id="list"></div>
 </aside>
+
+<div id="compact">
+  <div class="cb"><b>记忆星云</b><span id="cstat">— 条</span></div>
+  <button class="ci" id="cSearch" title="搜索与筛选">搜</button>
+  <button class="ci" id="cList" title="记忆列表">列</button>
+  <button class="ci" id="cGear" title="设置">设</button>
+</div>
 
 <div id="dock">
   <button id="spin" class="on">震动模式</button>
@@ -982,14 +1020,25 @@ function drawQuad(target, w, h, p, uniforms) {
 const state = { t0: performance.now(), last: 0 };
 let viewMatrix, projMatrix, vpMatrix;
 
-const ui = { left: false, right: false, focus: false };
+const ui = { left: false, right: false, focus: false, compact: false };
 const uiTouched = { left: false, right: false };
 function autoFit() {
   const w = window.innerWidth;
+  const h = window.innerHeight;
   let changed = false;
-  if (!uiTouched.right) { const want = w < 1000; if (want !== ui.right) { ui.right = want; changed = true; } }
-  if (!uiTouched.left) { const want = w < 820; if (want !== ui.left) { ui.left = want; changed = true; } }
+  // 设置页 iframe 常见尺寸就落在紧凑区间：这时侧栏改成按需弹出的浮层
+  const compact = w < 900 || h < 560;
+  if (compact !== ui.compact) { ui.compact = compact; changed = true; }
+  if (compact) {
+    if (!uiTouched.right && !ui.right) { ui.right = true; changed = true; }
+    if (!uiTouched.left && !ui.left) { ui.left = true; changed = true; }
+  } else {
+    if (!uiTouched.right) { const want = w < 1000; if (want !== ui.right) { ui.right = want; changed = true; } }
+    if (!uiTouched.left) { const want = w < 820; if (want !== ui.left) { ui.left = want; changed = true; } }
+  }
   if (changed) applyCollapse();
+  const st = document.querySelector('#cstat');
+  if (st) st.textContent = memNodes.filter((m) => m.id !== '__me__').length + ' 条记忆';
 }
 const layout = { shiftX: 0, distScale: 1, dist: 2.78, tShiftX: 0, tDistScale: 1 };
 
@@ -1004,7 +1053,8 @@ function updateLayout() {
   layout.tShiftX = ((lw + (W - rw)) / 2 - W / 2) / (W / 2);
   // 侧栏越少，画面越开阔；两个基准点：双栏 1.22、全宽 1.39
   const fill = clamp((avail / W - 0.5) / 0.5, 0, 1);
-  layout.tDistScale = 1.22 + 0.17 * fill;
+  // 小窗口里画面本来就只有几百像素，再拉远就看不见了
+  layout.tDistScale = ui.compact ? (1.02 + 0.14 * fill) : (1.22 + 0.17 * fill);
   const root = document.documentElement;
   root.style.setProperty('--scene-shift', (layout.tShiftX * W / 2).toFixed(1) + 'px');
   root.style.setProperty('--rail-right', (hideR ? 0 : (R && R.offsetWidth ? R.offsetWidth + 20 : 0)) + 'px');
@@ -1013,6 +1063,10 @@ function applyCollapse() {
   document.body.classList.toggle('left-collapsed', ui.left);
   document.body.classList.toggle('right-collapsed', ui.right);
   document.body.classList.toggle('focus-mode', ui.focus);
+  document.body.classList.toggle('compact', ui.compact);
+  const cl = document.querySelector('#cList'), cs = document.querySelector('#cSearch');
+  if (cl) cl.classList.toggle('on', !ui.right);
+  if (cs) cs.classList.toggle('on', !ui.left);
   const el = document.querySelector('#edgeL'), er = document.querySelector('#edgeR');
   if (el) { el.textContent = ui.left ? '\u203a' : '\u2039'; el.title = ui.left ? '展开左栏' : '收起左栏'; }
   if (er) { er.textContent = ui.right ? '\u2039' : '\u203a'; er.title = ui.right ? '展开右栏' : '收起右栏'; }
@@ -1497,6 +1551,10 @@ function bindUI() {
   const edgeL = $('#edgeL'), edgeR = $('#edgeR');
   if (edgeL) edgeL.onclick = () => { ui.left = !ui.left; uiTouched.left = true; applyCollapse(); };
   if (edgeR) edgeR.onclick = () => { ui.right = !ui.right; uiTouched.right = true; applyCollapse(); };
+  const cList = $('#cList'), cSearch = $('#cSearch'), cGear = $('#cGear');
+  if (cList) cList.onclick = () => { ui.right = !ui.right; uiTouched.right = true; applyCollapse(); };
+  if (cSearch) cSearch.onclick = () => { ui.left = !ui.left; uiTouched.left = true; applyCollapse(); };
+  if (cGear) cGear.onclick = () => openSettings(true);
   const gbtn = $('#gear');
   if (gbtn) gbtn.onclick = () => openSettings(true);
   const fbtn = $('#focus');
