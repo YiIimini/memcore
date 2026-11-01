@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import os
@@ -38,6 +39,10 @@ MAX_LIMIT = 2000            # 单次导出的记忆上限
 SOCKET_TIMEOUT = 15         # 慢连接不能长期占用线程
 GRAPH_TTL = 1.5             # 秒；面板连续刷新时不重复全表扫描
 ID_RE = re.compile(r"^(M\d{1,8}|__me__)$")
+# 1x1 透明 PNG：给浏览器和宿主页当探活信标用（<img> 不受 CORS 约束）
+FAVICON = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
 
 
 def host_name(value: str) -> str:
@@ -356,6 +361,8 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                     with open(path, "r", encoding="utf-8") as fh:
                         tpl = fh.read()
                     self._send(200, _inject(tpl, graph(m, qs)), "text/html; charset=utf-8")
+                elif u.path == "/favicon.ico":
+                    self._send(200, FAVICON, "image/png")
                 elif u.path == "/api/graph":
                     self._json(graph(m, qs))
                 elif u.path == "/api/stats":

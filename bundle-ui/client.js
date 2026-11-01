@@ -37,30 +37,32 @@ window.__ModuleLoader__.load({
                                         : matchMedia('(prefers-color-scheme: dark)').matches;
           const q = '&bg=' + encodeURIComponent(bg || (dark ? '#181818' : '#ffffff')) +
                     '&fg=' + encodeURIComponent(fg || (dark ? '#F2F2F4' : '#18181B'));
+          // 用 <img> 探活而不是 fetch：Electron/沙箱页面的 Origin 是 "null"，
+          // fetch 会被 CORS 拦掉（服务其实活着），而图片请求不受 CORS 约束。
+          const beacon = (p) => new Promise((resolve) => {
+            const img = new Image();
+            let done = false;
+            const finish = (ok) => {
+              if (done) return;
+              done = true;
+              img.onload = img.onerror = null;
+              clearTimeout(timer);
+              resolve(ok);
+            };
+            const timer = setTimeout(() => finish(false), 1200);
+            img.onload = () => finish(true);
+            img.onerror = () => finish(false);
+            img.src = 'http://127.0.0.1:' + p + '/favicon.ico?_=' + Date.now();
+          });
+
           for (const p of PORTS) {
-            // 每个端口 900ms 超时：一个只 accept 不响应的服务不能把设置页卡死，
-            // 并且要核对指纹，避免把本机别的 200 服务当成记忆面板嵌进来
-            const ctl = typeof AbortController === 'function' ? new AbortController() : null;
-            const timer = ctl ? setTimeout(() => ctl.abort(), 900) : null;
-            try {
-              const r = await fetch('http://127.0.0.1:' + p + '/api/stats',
-                ctl ? { signal: ctl.signal } : undefined);
-              if (timer) clearTimeout(timer);
-              if (!r.ok) continue;
-              const j = await r.json();
-              // 指纹优先认 app 字段；旧版面板没有这个字段，用 stats 的固有形状兜底，
-              // 否则「服务明明在跑」也会被判成没运行
-              const isMemcore = !!j && (j.app === 'memcore' ||
-                (typeof j.total === 'number' && typeof j.home === 'string' && typeof j.db === 'string'));
-              if (!isMemcore) continue;
-              if (alive) {
-                setBase('http://127.0.0.1:' + p + '/');
-                setSrc('http://127.0.0.1:' + p + '/?embed=1' + q);
-              }
-              return;
-            } catch (e) {
-              if (timer) clearTimeout(timer);
+            const up = await beacon(p);
+            if (!up) continue;
+            if (alive) {
+              setBase('http://127.0.0.1:' + p + '/');
+              setSrc('http://127.0.0.1:' + p + '/?embed=1' + q);
             }
+            return;
           }
           if (alive) setFailed(true);
         })();
