@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
+import sys
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 AGENTS_DIR = os.path.expanduser("~/Library/LaunchAgents")
-MEM = os.path.expanduser("~/.dsh/memory-core/mem")
-PY = "/usr/bin/python3"
+MEM = os.path.join(HERE, "mem")
+PY = sys.executable or shutil.which("python3") or "/usr/bin/python3"
 HOME = os.path.expanduser("~")
-LOG_DIR = os.path.expanduser("~/.dsh/memory")
+LOG_DIR = os.environ.get("MEM_HOME") or os.path.expanduser("~/.dsh/memory")
 
 PANEL_LABEL = "MemoryPanel"
 MAINTAIN_LABEL = "MemoryMaintain"
@@ -27,7 +30,10 @@ PANEL_PLIST = os.path.join(AGENTS_DIR, PANEL_LABEL + ".plist")
 MAINTAIN_PLIST = os.path.join(AGENTS_DIR, MAINTAIN_LABEL + ".plist")
 LEGACY = ("com.memcore.ui", "com.memcore.maintain")
 
-PATH = "/Users/x/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+PATH = os.pathsep.join([
+    os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+])
 
 
 def _run(*args):

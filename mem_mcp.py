@@ -86,22 +86,42 @@ TOOLS = [
 ]
 
 
+MAX_FRAME = 8 << 20   # 8 MiB：一条 JSON-RPC 帧的上限，防止单个巨型帧拖垮进程
+
+
+class FrameError(ValueError):
+    """A recoverable framing problem: report it, keep the loop alive."""
+
+
 def _read_message(stream):
     line = stream.readline()
     if not line:
         return None
     line = line.decode("utf-8", "replace").strip()
+    if not line:
+        return None
     if line.lower().startswith("content-length:"):
-        length = int(line.split(":")[1].strip())
+        try:
+            length = int(line.split(":", 1)[1].strip())
+        except (IndexError, ValueError):
+            raise FrameError("bad Content-Length header")
+        if length < 0 or length > MAX_FRAME:
+            raise FrameError("frame too large")
         while True:
             h = stream.readline()
             if not h or h in (b"\r\n", b"\n"):
                 break
         body = stream.read(length)
-        return json.loads(body.decode("utf-8"))
-    if not line:
-        return None
-    return json.loads(line)
+        if len(body) != length:
+            raise FrameError("truncated frame")
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise FrameError("invalid json: %s" % e)
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as e:
+        raise FrameError("invalid json: %s" % e)
 
 
 def _write(obj) -> None:
@@ -149,7 +169,13 @@ def main() -> int:
     while True:
         try:
             msg = _read_message(sys.stdin.buffer)
-        except Exception:
+        except FrameError as e:
+            # 坏帧会让字节流失步：先明确回报并留下诊断，再退出，绝不静默消失
+            _write({"jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32700, "message": "parse error: %s" % e}})
+            sys.stderr.write("mem_mcp: %s\n" % e)
+            break
+        except Exception:  # noqa: BLE001
             break
         if msg is None:
             break

@@ -229,9 +229,46 @@ class TestGraphFeatures(Base):
                        kind="fact", dedupe=False)
         rep = self.m.consolidate(dry_run=True)
         self.assertTrue(any({r["a"], r["b"]} == {a["id"], b["id"]} for r in rep))
+        # 默认写入模式只合并不退休：误判时不能毁掉真实事实
+        self.m.consolidate(dry_run=False)
+        self.assertEqual(self.m.get(a["id"])["status"], "active")
+        # 显式开启 auto_retire 才按合并结果关闭旧条目的有效期
+        self.m.cfg.setdefault("consolidate", {})["auto_retire"] = True
         self.m.consolidate(dry_run=False)
         self.assertEqual(self.m.get(a["id"])["status"], "superseded")
         self.assertEqual([h["id"] for h in self.m.search("部署脚本")][0], b["id"])
+
+    def test_consolidate_keeps_distinct_facts(self):
+        """模板相同、载荷不同的事实不能被当成重复删掉。"""
+        ids = [self.m.add("服务器 %d 的用途：备份" % i, title="服务器 %d" % i,
+                          kind="fact", dedupe=False)["id"] for i in range(12)]
+        self.m.cfg.setdefault("consolidate", {})["auto_retire"] = True
+        self.m.consolidate(dry_run=False)
+        alive = [i for i in ids if self.m.get(i)["status"] == "active"]
+        self.assertGreaterEqual(len(alive), 10, "批量 retire 误伤了独立事实")
+
+    def test_retired_memory_does_not_swallow_new_fact(self):
+        """退休后重新写同一事实，必须产生新的 active 行。"""
+        first = self.m.add("缓存目录在 /tmp/mc，重启后清空", title="缓存目录", kind="fact")
+        self.m.retire(first["id"], reason="测试")
+        again = self.m.add("缓存目录在 /tmp/mc，重启后清空", title="缓存目录", kind="fact")
+        self.assertNotEqual(again["id"], first["id"])
+        self.assertIsNone(again.get("deduped"))
+        self.assertEqual(self.m.get(again["id"])["status"], "active")
+
+    def test_update_recomputes_dedupe_hash(self):
+        """改过正文之后，原文再写入不能被判成同一条。"""
+        a = self.m.add("端口 8080 用于本地预览", title="预览端口", kind="fact")
+        self.m.update(a["id"], body="端口 9090 用于本地预览")
+        b = self.m.add("端口 8080 用于本地预览", title="预览端口", kind="fact")
+        self.assertNotEqual(b["id"], a["id"])
+
+    def test_retire_keeps_existing_meta(self):
+        mid = self.m.add("带元信息的条目", title="元信息", kind="todo", meta={"done": False, "prio": 3})["id"]
+        self.m.retire(mid, reason="改用别的方案")
+        meta = json.loads(self.m.get(mid)["meta"])
+        self.assertEqual(meta.get("prio"), 3)
+        self.assertEqual(meta.get("retire_reason"), "改用别的方案")
 
 
 if __name__ == "__main__":

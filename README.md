@@ -1,10 +1,23 @@
-# memory-core · 我自己的长期记忆系统
+# memcore · 给智能体的本地长期记忆
 
 [![tests](https://github.com/YiIimini/memcore/actions/workflows/test.yml/badge.svg)](https://github.com/YiIimini/memcore/actions/workflows/test.yml)
-`private repo · git@github.com:YiIimini/memcore.git`
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 
-单机、零依赖、可解释。给智能体用的「记忆存储 + 调用」整套工具：
-写入去重、混合检索、图谱关联、预算打包、历史会话灌入、MCP 工具暴露。
+**单机、零依赖、可解释的长期记忆库。** 写入去重、混合检索（FTS5 + 哈希 n-gram 语义）、
+图谱关联、token 预算打包、历史会话灌入、MCP 工具暴露，外加一个把记忆画成 3D 大脑的面板。
+
+![记忆星云](docs/nebula-preview.png)
+
+> **English TL;DR** — A local, dependency-free long-term memory store for LLM agents.
+> SQLite (FTS5 + hashed n-gram vectors) retrieval fused with RRF, dedupe on write,
+> budget-packed context, MCP tools, and a zero-dependency WebGL2 "memory nebula" panel.
+> Python 3.9+, stdlib only. `mem serve` → http://127.0.0.1:8790/
+
+| | |
+|---|---|
+| 双栏收起 | ![收起](docs/nebula-collapsed.png) |
+| 窄屏自适应 | ![窄屏](docs/nebula-narrow.png) |
 
 ```
 ~/.dsh/memory-core/          代码
@@ -13,7 +26,10 @@
 ├── mem_mcp.py               MCP stdio 服务：memory_search|recall|brief|add|get|stats
 ├── bench.py                 规模与延迟基准
 ├── tests_eval.py            真实语料上的中文改写检索评测
-├── tests/test_memcore.py    18 个单元测试
+├── tests/test_memcore.py    引擎单元测试
+├── tests/test_server.py     面板安全回归（Host/Origin/上限/注入）
+├── ui/nebula.html           记忆星云（3D 鎏金大脑，零依赖 WebGL2）
+├── ui/index.html            经典 2D 力导向图谱（/classic）
 ├── SKILL.md                 使用纪律（何时查、怎么写）
 └── tools/sessions_dump.js   解压 dsh 会话归档
 
@@ -24,6 +40,48 @@
 ├── BRIEF.md                 会话开场简报
 └── config.json              权重与阈值（可调，不需改代码）
 ```
+
+## 0. 两种视图
+
+```bash
+mem serve --port 8790
+# http://127.0.0.1:8790/        记忆星云（3D 鎏金大脑 + 记忆光流）—— 默认
+# http://127.0.0.1:8790/classic 经典 2D 力导向图（原界面）
+```
+
+星云视图 `ui/nebula.html`：零依赖 WebGL2，脑壳点云 + 螺旋纤维 + 白质放射纤维 + 记忆节点光流 +
+离屏辉光；左侧栏走 `/api/graph`，右侧栏按 标准/技术/旧痕/评估 分类。拖动旋转、滚轮缩放、点节点看详情。
+
+**自适应与入口**（任何宽度都退得回来）：
+
+| 情况 | 行为 |
+|---|---|
+| 窗口 < 1000 / < 820 | 自动收起右栏 / 左栏，画面重新居中并缩放（相机平滑过渡，不是跳变） |
+| 屏幕左右边缘 | 常驻竖条把手 `‹ ›`，收起后点它就能打开，不存在"关掉找不回来" |
+| 底部 hold 栏 | `沉浸` 只隐藏两栏，dock 保留且半透明悬浮，`退出沉浸` 或 `Esc` 恢复 |
+| 折叠状态 | 记在 localStorage；自动折叠不算用户选择，不会污染下次打开 |
+| 页面构建 1~3 秒 | 全屏启动遮罩「正在点亮星云」，避免新窗口打开时白屏被当成故障 |
+| 设置面板工具栏 | `复制链接` 兜底：宿主拦 `target=_blank` 时也能把地址拿去浏览器打开 |
+
+## 0.5 安全边界
+
+面板只绑 `127.0.0.1`，但"本机"并不等于"可信"——浏览器里任何一个网页都能向回环地址发请求。
+所以请求门是默认拒绝的：
+
+| 面 | 做法 |
+|---|---|
+| Host | 必须是 `127.0.0.1` / `localhost` / `::1`，否则 421（挡 DNS rebinding） |
+| CORS | 只回显回环 Origin，从不下发 `*`；外来 Origin 拿不到任何读取授权 |
+| 写操作 | Origin 非法直接 403；破坏性动作校验 id 形态并返回真实结果 |
+| 请求体 | 上限 1 MiB，超出 413；查询参数限幅（`limit ≤ 2000`） |
+| 连接 | 15 秒读超时，慢连接不长期占线程 |
+| 响应头 | `nosniff` + `Referrer-Policy` + CSP（含 `frame-ancestors`） |
+| 内嵌数据 | `<` 与 U+2028/2029 全部转义，记忆正文无法打断 `<script>` |
+| 网关 | `llm.base` 只接受 https 或回环 http，且只对已配置地址附带本机 Key，禁止跟随重定向 |
+| 凭据 | `secrets.json` 以 0600 创建（先建文件后写内容，无 0644 窗口） |
+| 索引 | 只读文档类文件；`.ssh/`、`.aws/`、`.env`、`secrets.json` 等一律不读进记忆 |
+
+`tests/test_server.py` 把上面每一条都钉成回归测试。
 
 ## 1. 数据模型
 
@@ -115,7 +173,7 @@ $M stats --json
 2. **MCP 工具**（原生 tool calling）：
    ```json
    {"mcpServers": {"memory": {"command": "python3",
-     "args": ["/Users/x/.dsh/memory-core/mem_mcp.py"]}}}
+     "args": ["~/.dsh/memory-core/mem_mcp.py"]}}}
    ```
    暴露 `memory_search / memory_recall / memory_brief / memory_add / memory_get / memory_stats`。
 3. **MCP 原生工具**（已装进 desktop profile）：`mcp__memory__memory_search / _recall / _brief / _add / _get / _stats`，

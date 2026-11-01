@@ -55,7 +55,7 @@ canvas.grabbing{cursor:grabbing}
 .hint{font-size:12px;line-height:16px;color:var(--muted)}
 .section-title{font-size:12px;line-height:16px;color:var(--muted);letter-spacing:.04em;margin:0}
 #kinds{display:flex;flex-wrap:wrap;gap:8px}
-.chip{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border-radius:999px;
+.chip{flex:0 0 auto;display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border-radius:999px;
   border:1px solid var(--line);background:transparent;color:var(--muted);cursor:pointer;
   font-size:12px;line-height:16px;transition:color var(--dur-fast) var(--ease),
   background-color var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease)}
@@ -956,11 +956,19 @@ async function action(name, label){
 async function boot(){
   const params = new URLSearchParams(location.search);
   if (params.get('embed') === '1') document.body.classList.add('embed');
+  // 主题参数只接受颜色字面量：否则 ?bg=url(https://…) 能让面板一打开就外连
+  const safeColor = (v, fallback) => {
+    const t = String(v || '').trim();
+    if (/^#[0-9a-f]{3,8}$/i.test(t)) return t;
+    if (/^rgba?\(\s*[\d.,%\s]{1,40}\)$/i.test(t)) return t;
+    if (/^(transparent|currentcolor|[a-z]{3,20})$/i.test(t)) return t;
+    return fallback;
+  };
   const hostBg = params.get('bg'), hostFg = params.get('fg');
   if (hostBg || hostFg){
     document.body.classList.add('hosted');
-    document.documentElement.style.setProperty('--host-bg', hostBg || 'transparent');
-    document.documentElement.style.setProperty('--host-fg', hostFg || '#F2F2F4');
+    document.documentElement.style.setProperty('--host-bg', safeColor(hostBg, 'transparent'));
+    document.documentElement.style.setProperty('--host-fg', safeColor(hostFg, '#F2F2F4'));
   }
   canvas = document.getElementById('cv');
   ctx = canvas.getContext('2d');
@@ -994,6 +1002,7 @@ async function boot(){
     gf.addEventListener('click', openSettings);
   }
   window.addEventListener('message', ev => {
+    if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(ev.origin || '')) return;
     const d = ev.data || {};
     if (!d || typeof d.type !== 'string' || d.type.indexOf('mem:') !== 0) return;
     if (d.type === 'mem:settings') openSettings();

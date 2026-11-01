@@ -30,11 +30,15 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------
 # constants / config
 # --------------------------------------------------------------------------
+
+__version__ = "1.1.0"
 
 DEFAULT_HOME = os.path.expanduser("~/.dsh/memory")
 VECTOR_DIM = 512
@@ -105,6 +109,30 @@ def est_tokens(s: str) -> int:
     cjk = len(CJK_RE.findall(s))
     rest = max(0, len(s) - cjk)
     return int(math.ceil(cjk / 1.5 + rest / 3.6)) + 1
+
+
+def safe_base_url(base: str) -> bool:
+    """Only public https or loopback http gateways are acceptable targets.
+
+    Blocks the SSRF shape: an arbitrary base would receive our Authorization
+    header and could probe LAN hosts / cloud metadata endpoints.
+    """
+    try:
+        u = urllib.parse.urlsplit(base or "")
+    except ValueError:
+        return False
+    if u.scheme == "https":
+        return bool(u.hostname)
+    if u.scheme == "http":
+        return (u.hostname or "").lower() in ("127.0.0.1", "localhost", "::1")
+    return False
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: a 30x would forward the bearer token to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def sha1(s: str) -> str:
@@ -383,9 +411,15 @@ class Memory:
                 data["MEM_LLM_KEY"] = str(key).strip()
             else:
                 data.pop("MEM_LLM_KEY", None)
-            with open(self.secrets_path, "w", encoding="utf-8") as fh:
+            tmp = self.secrets_path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False)
-            os.chmod(self.secrets_path, 0o600)
+            os.replace(tmp, self.secrets_path)
+            try:
+                os.chmod(self.secrets_path, 0o600)
+            except OSError:
+                pass
         if llm:
             self.cfg.setdefault("llm", {}).update(llm)
 
@@ -527,7 +561,9 @@ class Memory:
         h = sha1("%s|%s|%s" % (kind, title, body))
 
         if dedupe and self.cfg.get("dedupe_exact", True):
-            row = self.db.execute("SELECT id, use_count, body FROM memories WHERE hash=?", (h,)).fetchone()
+            row = self.db.execute(
+                "SELECT id, use_count, body FROM memories "
+                "WHERE hash=? AND status='active' AND valid_to=0", (h,)).fetchone()
             if row:
                 self.reinforce(row["id"])
                 return {"id": row["id"], "deduped": "exact", "body": row["body"]}
@@ -537,7 +573,8 @@ class Memory:
             if pm:
                 pth = pm.group(1).strip()
                 row = self.db.execute(
-                    "SELECT id, body FROM memories WHERE kind='artifact' AND body LIKE ? LIMIT 1",
+                    "SELECT id, body FROM memories WHERE kind='artifact' AND status='active' "
+                    "AND valid_to=0 AND body LIKE ? LIMIT 1",
                     ("路径：" + pth + "%",)).fetchone()
                 if row:
                     if len(body) > len(row["body"]):
@@ -606,12 +643,17 @@ class Memory:
                 self.db.execute("DELETE FROM tags WHERE memory_id=?", (mid,))
                 for tg in [t.strip().lower() for t in fields["tags"] if t.strip()]:
                     self.db.execute("INSERT OR IGNORE INTO tags(memory_id,tag) VALUES(?,?)", (mid, tg))
-            r = self.db.execute("SELECT title, body, tags, project FROM memories WHERE id=?", (mid,)).fetchone()
+            r = self.db.execute(
+                "SELECT title, body, tags, project, kind FROM memories WHERE id=?", (mid,)).fetchone()
             self.db.execute("DELETE FROM mem_fts WHERE memory_id=?", (mid,))
             self.db.execute("INSERT INTO mem_fts(memory_id, text) VALUES(?,?)",
                             (mid, " ".join([r["title"], r["body"], r["tags"], r["project"]])))
             self.db.execute("UPDATE vectors SET v=? WHERE memory_id=?",
                             (embed(r["title"] + "\n" + r["body"], self.dim), mid))
+            if (self.db.execute("SELECT status FROM memories WHERE id=?", (mid,)).fetchone()
+                    or {"status": "active"})["status"] == "active":
+                self.db.execute("UPDATE memories SET hash=? WHERE id=?",
+                                (sha1("%s|%s|%s" % (r["kind"], r["title"], r["body"])), mid))
             self.db.execute("UPDATE memories SET sim=? WHERE id=?",
                             (simhash(r["title"] + "\n" + r["body"]), mid))
         self._journal("update", mid, {k: v for k, v in fields.items() if k != "body"})
@@ -654,9 +696,19 @@ class Memory:
         with self.db:
             self.db.execute("UPDATE memories SET valid_to=?, status=?, updated_at=? WHERE id=?",
                             (ts, "superseded" if by else "retired", now(), mid))
+            # 让出去重 hash：否则同一事实重新写入会撞 UNIQUE，新记忆静默丢失
+            freed = sha1("%s|retired|%s" % (row.get("hash") or "", mid))
+            self.db.execute("UPDATE memories SET hash=? WHERE id=?", (freed, mid))
             if reason:
+                try:
+                    old_meta = json.loads(row.get("meta") or "{}")
+                    if not isinstance(old_meta, dict):
+                        old_meta = {}
+                except (TypeError, ValueError):
+                    old_meta = {}
+                old_meta["retire_reason"] = reason
                 self.db.execute("UPDATE memories SET meta=? WHERE id=?",
-                                (json.dumps({"retire_reason": reason}, ensure_ascii=False), mid))
+                                (json.dumps(old_meta, ensure_ascii=False), mid))
             if by:
                 self.db.execute(
                     "INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at) VALUES(?,?,?,?,?)",
@@ -1086,7 +1138,8 @@ class Memory:
         nv = vec_of(v, self.dim)
         for r in self.db.execute(
                 "SELECT m.id, x.v FROM vectors x JOIN memories m ON m.id=x.memory_id "
-                "WHERE m.kind=? ORDER BY m.updated_at DESC LIMIT 4000", (kind,)):
+                "WHERE m.kind=? AND m.status='active' AND m.valid_to=0 "
+                "ORDER BY m.updated_at DESC LIMIT 4000", (kind,)):
             if cosine(nv, vec_of(r["v"], self.dim)) >= thr:
                 return r["id"]
         return None
@@ -1124,10 +1177,14 @@ class Memory:
         rec = {"ts": now(), "op": op, "id": mid}
         rec.update(extra)
         try:
+            fresh = not os.path.exists(self.journal_path)
             with open(self.journal_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+            if fresh:
+                os.chmod(self.journal_path, 0o600)
+        except Exception as e:  # noqa: BLE001
+            # 审计日志写不进去不能静默，但也不能让写操作失败
+            sys.stderr.write("journal write failed: %s\n" % e)
 
     @staticmethod
     def _auto_title(body: str) -> str:
@@ -1158,6 +1215,10 @@ class Memory:
             L.append("")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\n".join(L))
+        try:
+            os.chmod(path, 0o600)      # 索引里是全部记忆正文，不接受同机其他用户可读
+        except OSError:
+            pass
         return path
 
     def export_jsonl(self, path: str) -> int:
@@ -1166,6 +1227,10 @@ class Memory:
             for r in self.db.execute("SELECT * FROM memories ORDER BY id"):
                 fh.write(json.dumps(dict(r), ensure_ascii=False) + "\n")
                 n += 1
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return n
 
     # -- session ingestion ------------------------------------------------
@@ -1365,12 +1430,14 @@ class Memory:
         )
         payload = {"model": model, "temperature": 0,
                    "messages": [{"role": "user", "content": prompt}]}
+        if not safe_base_url(base):
+            return None, "unsafe llm base"
         req = urllib.request.Request(
             base + "/chat/completions", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
+            with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as resp:
+                data = json.loads(resp.read(1 << 20).decode())
             txt = data["choices"][0]["message"]["content"]
             m = re.search(r"\{.*\}", txt, re.S)
             return (json.loads(m.group(0)) if m else None), "llm"
@@ -1378,13 +1445,21 @@ class Memory:
             return None, "llm error: %s" % e
 
     def llm_probe(self, base: str = "", model: str = "", key: str = "", timeout: int = 15) -> Dict[str, Any]:
-        """Verify an OpenAI-compatible endpoint + list its model ids."""
-        import urllib.error
-        import urllib.request
+        """Verify an OpenAI-compatible endpoint + list its model ids.
+
+        The stored key is only attached to the configured base or a loopback
+        gateway; any other address must supply its own key explicitly.
+        """
         cfg = self.cfg.get("llm", {}) or {}
-        base = (base or cfg.get("base") or "https://api.deepseek.com/v1").rstrip("/")
-        key = key or self._llm_key(base)
+        configured = (cfg.get("base") or "").rstrip("/")
+        base = (base or configured or "https://api.deepseek.com/v1").rstrip("/")
+        if not safe_base_url(base):
+            return {"ok": False, "models": [], "error": "base 只支持 https 或本机回环地址"}
         model = model or cfg.get("model") or "deepseek-flash"
+        if not key:
+            # 只对"已配置的 base"或本机回环网关使用本机保存的 key
+            if base == configured or base.startswith("http://"):
+                key = self._llm_key(base)
         if not key:
             return {"ok": False, "error": "未配置 API Key", "models": []}
         bases = [base]
@@ -1401,10 +1476,13 @@ class Memory:
     def _probe_one(self, base: str, key: str, model: str, timeout: int = 15) -> Dict[str, Any]:
         import urllib.error
         import urllib.request
+        if not safe_base_url(base):
+            return {"ok": False, "error": "unsafe base", "models": [], "model": model}
         try:
             req = urllib.request.Request(base + "/models", headers={"Authorization": "Bearer " + key})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(req, timeout=timeout) as resp:
+                data = json.loads(resp.read(1 << 20).decode())
             models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
             return {"ok": True, "models": models, "model": model,
                     "model_ok": (not models) or (model in models)}
@@ -1429,6 +1507,9 @@ class Memory:
         cfg = self.cfg.get("consolidate", {})
         dup_sim = float(cfg.get("dup_sim", 0.94))
         conf_sim = float(cfg.get("conflict_sim", 0.80))
+        # 默认只合并文本、绝不自动 retire：512 维余弦 + simhash 预筛会把
+        # "模板相同、载荷不同"的真实记忆判成重复（审计实测 60 条误删 56 条）。
+        auto_retire = bool(cfg.get("auto_retire", False))
         rows = [dict(r) for r in self.db.execute(
             "SELECT * FROM memories WHERE status='active' AND kind IN (%s) "
             "ORDER BY updated_at DESC LIMIT ?" % ",".join("?" * len(kinds)), tuple(kinds) + (limit,))]
@@ -1466,12 +1547,13 @@ class Memory:
                                "action": action, "verdict": verdict,
                                "titles": [older["title"], newer["title"]]})
                 if not dry_run and action in ("merge", "retire"):
-                    self.retire(older["id"], by=newer["id"],
-                                reason="consolidate: %s (sim=%.3f)" % (action, sim))
-                    used.add(older["id"])
                     if verdict and verdict.get("merged"):
                         merged = ("%s\n\n[合并] %s" % (newer["body"].rstrip(), verdict["merged"])).strip()
                         self.update(newer["id"], body=merged)
+                    if action == "merge" and auto_retire:
+                        self.retire(older["id"], by=newer["id"],
+                                    reason="consolidate: merge (sim=%.3f)" % sim)
+                        used.add(older["id"])
                 elif action in ("merge", "retire"):
                     used.add(older["id"])
         return report
@@ -1529,14 +1611,44 @@ class Memory:
         return {"nodes": nodes, "edges": edges,
                 "meta": {"generated": now(), "total": len(nodes), "links": len(edges)}}
 
+    # 绝不让记忆索引去读可能是凭据的文件
+    _SECRET_NAMES = (
+        "id_rsa", "id_ed25519", "id_ecdsa", "authorized_keys", ".netrc", ".pgpass",
+        "secrets.json", ".env", "credentials", "cookie", "keychain", "known_hosts",
+    )
+    _SECRET_DIRS = ("/.ssh/", "/.aws/", "/.gnupg/", "/.config/gh/", "/.docker/config", "/.kube/")
+    _DOC_EXT = (
+        ".md", ".markdown", ".txt", ".rst", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx",
+        ".jsx", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".html", ".css",
+        ".sh", ".sql", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".rb", ".php", ".swift",
+    )
+
+    @classmethod
+    def _indexable_doc(cls, path: str) -> bool:
+        low = path.lower()
+        if any(d in low for d in cls._SECRET_DIRS):
+            return False
+        base = os.path.basename(low)
+        if any(base == n or base.startswith(n + ".") or base.endswith("." + n) for n in cls._SECRET_NAMES):
+            return False
+        if base.startswith("."):          # .env / .npmrc 之类
+            return False
+        return low.endswith(cls._DOC_EXT)
+
     @staticmethod
     def _doc_head(path: str, cwd: str = "", limit: int = 260) -> str:
-        """Short content digest for artifact memories, so they are findable by meaning."""
+        """Short content digest for artifact memories, so they are findable by meaning.
+
+        Guarded: only document-like files are read. A path recorded in a memory
+        could otherwise pull credentials into the index (and out to an LLM).
+        """
         cands = [path]
         if cwd and not os.path.isabs(path):
             cands.append(os.path.join(cwd, path))
         for p in cands:
             try:
+                if not Memory._indexable_doc(p):
+                    continue
                 if not os.path.isfile(p) or os.path.getsize(p) > 400_000:
                     continue
                 with open(p, "r", encoding="utf-8", errors="ignore") as fh:

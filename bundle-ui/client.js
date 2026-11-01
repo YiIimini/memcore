@@ -5,7 +5,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const { useState, useEffect, useRef } = React;
 
-    const PORTS = [8790, 8791, 8792, 8793, 8794, 8795];
+    const PORTS = [8790, 8791, 8792, 8793, 8794, 8795, 8796, 8797, 8798, 8799];
     const btn = {
       padding: '8px 12px', borderRadius: 8, border: '1px solid #272727', background: 'rgba(255,255,255,.06)',
       color: 'inherit', fontSize: 14, lineHeight: '20px', cursor: 'pointer',
@@ -14,6 +14,8 @@ window.__ModuleLoader__.load({
 
     function MemorySection() {
       const [src, setSrc] = useState('');
+      const [base, setBase] = useState('');
+      const [copied, setCopied] = useState(false);
       const [failed, setFailed] = useState(false);
       const frame = useRef(null);
 
@@ -37,10 +39,25 @@ window.__ModuleLoader__.load({
           const q = '&bg=' + encodeURIComponent(bg || (dark ? '#181818' : '#ffffff')) +
                     '&fg=' + encodeURIComponent(fg || (dark ? '#F2F2F4' : '#18181B'));
           for (const p of PORTS) {
+            // 每个端口 900ms 超时：一个只 accept 不响应的服务不能把设置页卡死，
+            // 并且要核对指纹，避免把本机别的 200 服务当成记忆面板嵌进来
+            const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+            const timer = ctl ? setTimeout(() => ctl.abort(), 900) : null;
             try {
-              const r = await fetch('http://127.0.0.1:' + p + '/api/graph?limit=1');
-              if (r.ok) { if (alive) setSrc('http://127.0.0.1:' + p + '/?embed=1' + q); return; }
-            } catch (e) { /* next port */ }
+              const r = await fetch('http://127.0.0.1:' + p + '/api/stats',
+                ctl ? { signal: ctl.signal } : undefined);
+              if (timer) clearTimeout(timer);
+              if (!r.ok) continue;
+              const j = await r.json();
+              if (!j || j.app !== 'memcore') continue;
+              if (alive) {
+                setBase('http://127.0.0.1:' + p + '/');
+                setSrc('http://127.0.0.1:' + p + '/?embed=1' + q);
+              }
+              return;
+            } catch (e) {
+              if (timer) clearTimeout(timer);
+            }
           }
           if (alive) setFailed(true);
         })();
@@ -62,16 +79,27 @@ window.__ModuleLoader__.load({
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, height: '100%' } },
         h('div', { style: bar },
-          h('span', { style: title }, '记忆图谱'),
+          h('span', { style: title }, '记忆星云'),
           h('button', { style: btn, onClick: () => send('mem:reload') }, '刷新'),
           h('button', { style: btn, onClick: () => send('mem:settings') }, '设置'),
+          src ? h('button', {
+            style: btn,
+            onClick: async () => {
+              try {
+                await navigator.clipboard.writeText(base || 'http://127.0.0.1:8790/');
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1600);
+              } catch (e) { /* 剪贴板不可用时忽略 */ }
+            },
+          }, copied ? '已复制' : '复制链接') : null,
           src ? h('a', {
-            href: src.replace('?embed=1', ''), target: '_blank', rel: 'noreferrer',
+            href: base || 'http://127.0.0.1:8790/', target: '_blank', rel: 'noreferrer',
             style: { ...btn, textDecoration: 'none' },
           }, '新窗口打开') : null,
         ),
         src ? h('iframe', {
-          ref: frame, src, title: '记忆图谱',
+          ref: frame, src, title: '记忆星云',
+          sandbox: 'allow-scripts allow-same-origin allow-forms allow-downloads',
           style: { flex: 1, width: '100%', minHeight: 520, border: '1px solid rgba(255,255,255,.14)', borderRadius: 12, background: 'transparent' },
         }) : h('div', { style: { width: '100%', height: 260, borderRadius: 12, background: 'rgba(255,255,255,.06)', border: '1px solid #272727' } }),
       );
