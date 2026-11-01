@@ -132,6 +132,29 @@ h1 em{font-style:normal;color:var(--gold-hi);
   box-shadow:0 0 8px 1px rgba(95,216,255,.8);animation:pulse 2.4s infinite ease-in-out}
 @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
 
+/* ---------- 设置抽屉 ---------- */
+#settings{position:fixed;z-index:12;right:20px;top:20px;width:326px;padding:16px;
+  display:none;flex-direction:column;gap:10px;max-height:calc(100vh - 40px);overflow:auto}
+body.embed #settings{right:12px;top:12px;width:300px}
+#settings.open{display:flex}
+#settings .sh{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--fg)}
+#settings .sh b{font-weight:500;letter-spacing:.08em}
+#settings .sh button{margin-left:auto;width:24px;height:24px;border-radius:7px;border:1px solid var(--line);
+  background:transparent;color:var(--muted);cursor:pointer;font-size:12px;line-height:1;padding:0}
+#settings .sh button:hover{color:#fff;border-color:var(--line-2)}
+#settings label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--dim);letter-spacing:.06em}
+#settings input{padding:7px 10px;border-radius:8px;border:1px solid var(--line);
+  background:rgba(140,190,255,.05);color:var(--fg);font:inherit;font-size:12px;outline:none}
+#settings input:focus{border-color:rgba(255,197,107,.5)}
+#settings .acts{display:flex;gap:6px;flex-wrap:wrap}
+#settings .acts button{flex:1 1 auto;padding:7px 10px;border-radius:8px;border:1px solid var(--line);
+  background:rgba(255,255,255,.04);color:var(--muted);font:inherit;font-size:11.5px;cursor:pointer;
+  transition:all .22s var(--ease);white-space:nowrap}
+#settings .acts button:hover{color:#fff;border-color:var(--line-2)}
+#settings .acts button.primary{color:var(--gold-hi);border-color:rgba(255,197,107,.4);background:rgba(255,197,107,.09)}
+#settings .divider{font-size:10px;letter-spacing:.16em;color:var(--dim);margin-top:4px}
+#s-status{font-size:11px;line-height:17px;color:var(--muted);min-height:16px}
+
 #bubble{position:fixed;z-index:9;max-width:320px;padding:12px 14px;border-radius:13px;
   background:rgba(8,13,22,.86);backdrop-filter:blur(18px);border:1px solid var(--line-2);
   box-shadow:0 20px 60px -18px #000;pointer-events:none;opacity:0;transform:translateY(6px);
@@ -271,9 +294,25 @@ body.embed #conn{bottom:16px;right:16px}
   <button id="spin" class="on">震动模式</button>
   <button id="orbit">转动视角</button>
   <button id="reset">重置视角</button>
+  <button id="gear">设置</button>
   <button id="focus">沉浸</button>
 </div>
 <div id="conn">已连接<span id="clock">00:00:00</span></div>
+<div id="settings" class="glass">
+  <div class="sh"><b>设置</b><button id="setClose" title="关闭">✕</button></div>
+  <label>Base URL<input id="s-base" placeholder="https://api.deepseek.com/v1" autocomplete="off"></label>
+  <label>模型<input id="s-model" placeholder="deepseek-chat" autocomplete="off"></label>
+  <label>API Key<input id="s-key" type="password" placeholder="留空表示不修改" autocomplete="off"></label>
+  <div class="acts"><button id="s-test">测试连接</button><button id="s-save" class="primary">保存</button></div>
+  <div id="s-status"></div>
+  <div class="divider">维护</div>
+  <div class="acts">
+    <button data-act="maintain">立即维护</button>
+    <button data-act="relink">重建边</button>
+    <button data-act="reindex">重建索引</button>
+    <button data-act="export">导出索引</button>
+  </div>
+</div>
 <div id="bubble"></div>
 <div id="empty">还没有记忆。用 mem add 写下第一条。</div>
 
@@ -560,6 +599,31 @@ gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 
 /* ---- 通用绘制封装 ---- */
+const liveBuffers = [];
+const liveVAOs = [];
+function mkbuf(arr, dynamic) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, arr, dynamic ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
+  liveBuffers.push(b);
+  return b;
+}
+let sceneMark = { v: 0, b: 0 };
+function markScene() { sceneMark.v = liveVAOs.length; sceneMark.b = liveBuffers.length; }
+function disposeSinceMark() {
+  for (let i = sceneMark.v; i < liveVAOs.length; i++) { try { gl.deleteVertexArray(liveVAOs[i]); } catch (e) { /* ignore */ } }
+  for (let i = sceneMark.b; i < liveBuffers.length; i++) { try { gl.deleteBuffer(liveBuffers[i]); } catch (e) { /* ignore */ } }
+  liveVAOs.length = sceneMark.v;
+  liveBuffers.length = sceneMark.b;
+}
+
+function disposeScene() {
+  liveVAOs.forEach((v) => { try { gl.deleteVertexArray(v); } catch (e) { /* ignore */ } });
+  liveBuffers.forEach((b) => { try { gl.deleteBuffer(b); } catch (e) { /* ignore */ } });
+  liveVAOs.length = 0;
+  liveBuffers.length = 0;
+}
+
 function makeVAO(defs) {
   const vao = gl.createVertexArray();
   gl.bindVertexArray(vao);
@@ -569,6 +633,7 @@ function makeVAO(defs) {
     gl.vertexAttribPointer(d.loc, d.size, gl.FLOAT, false, 0, 0);
   });
   gl.bindVertexArray(null);
+  liveVAOs.push(vao);
   return vao;
 }
 function attrib(p, name) { return gl.getAttribLocation(p, name); }
@@ -578,7 +643,8 @@ function attrib(p, name) { return gl.getAttribLocation(p, name); }
    ============================================================ */
 const GROUP = { shellDots: null, shellLines: null, memLines: null, memDots: null, flow: null, rings: null, stars: null };
 const memNodes = [];   // {id,title,kind,x,y,z,size,col,deg,sal}
-const cam = { yaw: 0.13, pitch: 0.085, dist: 2.78, spin: true, spinSpeed: 0.018 };
+const cam = { yaw: 0.13, pitch: 0.085, dist: 2.78, spin: true, spinSpeed: 0.11,
+  yawTarget: null, shake: 0, pulse: 1 };
 let hovered = null, selected = null, query = '', activeKinds = null, showRetired = false;
 let projScale = 1000, W = 1, H = 1, DPR = 1;
 
@@ -673,15 +739,13 @@ function buildShell() {
     lc[o4] = c[0]; lc[o4 + 1] = c[1]; lc[o4 + 2] = c[2]; lc[o4 + 3] = 0.05; o4 += 4;
   }
   GROUP.shellLines = makeVAO([
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, lp, gl.STATIC_DRAW); return b; })(), loc: attrib(pLine, 'a_pos'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, lc, gl.STATIC_DRAW); return b; })(), loc: attrib(pLine, 'a_col'), size: 4 },
+    { buf: mkbuf(lp), loc: attrib(pLine, 'a_pos'), size: 3 },
+    { buf: mkbuf(lc), loc: attrib(pLine, 'a_col'), size: 4 },
   ]);
   GROUP.shellLineCount = lp.length / 3;
 
   // 点云
-  const db = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, db); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
-  const cb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cb); gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
-  const sb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, size, gl.STATIC_DRAW);
+  const db = mkbuf(pos), cb = mkbuf(col), sb = mkbuf(size);
   GROUP.shellDots = makeVAO([
     { buf: db, loc: attrib(pDot, 'a_pos'), size: 3 },
     { buf: cb, loc: attrib(pDot, 'a_col'), size: 4 },
@@ -692,6 +756,7 @@ function buildShell() {
 
 /* ---- 2. 记忆节点 + 记忆边 + 光流 ---- */
 function buildMemories() {
+  memNodes.length = 0;
   const nodes = DATA.nodes || [];
   const byId = new Map();
   const goldN = nodes.filter((n) => isGold(n.kind)).length;
@@ -767,18 +832,18 @@ function buildMemBuffers(byId, core) {
   });
   GROUP.memLineCount = lp.length / 3;
   GROUP.memLines = makeVAO([
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lp), gl.STATIC_DRAW); return b; })(), loc: attrib(pLine, 'a_pos'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lc), gl.STATIC_DRAW); return b; })(), loc: attrib(pLine, 'a_col'), size: 4 },
+    { buf: mkbuf(new Float32Array(lp)), loc: attrib(pLine, 'a_pos'), size: 3 },
+    { buf: mkbuf(new Float32Array(lc)), loc: attrib(pLine, 'a_col'), size: 4 },
   ]);
   GROUP.flowCount = fg.length;
   GROUP.flow = makeVAO([
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fp0), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_p0'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fp1), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_p1'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fbend), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_bend'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fu1), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_phase'), size: 1 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fu2), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_speed'), size: 1 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fc), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_col'), size: 4 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fg), gl.STATIC_DRAW); return b; })(), loc: attrib(pFlow, 'a_glow'), size: 1 },
+    { buf: mkbuf(new Float32Array(fp0)), loc: attrib(pFlow, 'a_p0'), size: 3 },
+    { buf: mkbuf(new Float32Array(fp1)), loc: attrib(pFlow, 'a_p1'), size: 3 },
+    { buf: mkbuf(new Float32Array(fbend)), loc: attrib(pFlow, 'a_bend'), size: 3 },
+    { buf: mkbuf(new Float32Array(fu1)), loc: attrib(pFlow, 'a_phase'), size: 1 },
+    { buf: mkbuf(new Float32Array(fu2)), loc: attrib(pFlow, 'a_speed'), size: 1 },
+    { buf: mkbuf(new Float32Array(fc)), loc: attrib(pFlow, 'a_col'), size: 4 },
+    { buf: mkbuf(new Float32Array(fg)), loc: attrib(pFlow, 'a_glow'), size: 1 },
   ]);
 
   // 节点点（动态颜色：hover/选中时变亮，所以每帧重写）
@@ -793,9 +858,9 @@ function buildMemBuffers(byId, core) {
     GROUP.memCol[i * 4 + 3] = 0.85;
     GROUP.memSize[i] = m.size;
   });
-  const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, GROUP.memPos, gl.DYNAMIC_DRAW);
-  const cb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cb); gl.bufferData(gl.ARRAY_BUFFER, GROUP.memCol, gl.DYNAMIC_DRAW);
-  const sb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, sb); gl.bufferData(gl.ARRAY_BUFFER, GROUP.memSize, gl.DYNAMIC_DRAW);
+  const pb = mkbuf(GROUP.memPos, true);
+  const cb = mkbuf(GROUP.memCol, true);
+  const sb = mkbuf(GROUP.memSize, true);
   GROUP.memBufs = { pb, cb, sb };
   GROUP.memDots = makeVAO([
     { buf: pb, loc: attrib(pDot, 'a_pos'), size: 3 },
@@ -811,6 +876,7 @@ function hex(h) {
 
 /* ---- 3. 轨道环 + 星点 ---- */
 function buildDecor() {
+  GROUP.rings = null; GROUP.stars = null;
   const lp = [], lc = [];
   const rings = [
     { r: 1.42, tilt: 0.30, squash: 0.34, a: 0.16 },
@@ -834,8 +900,8 @@ function buildDecor() {
   });
   GROUP.ringCount = lp.length / 3;
   GROUP.rings = makeVAO([
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lp), gl.STATIC_DRAW); return b; })(), loc: attrib(pLine, 'a_pos'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lc), gl.STATIC_DRAW); return b; })(), loc: attrib(pLine, 'a_col'), size: 4 },
+    { buf: mkbuf(new Float32Array(lp)), loc: attrib(pLine, 'a_pos'), size: 3 },
+    { buf: mkbuf(new Float32Array(lc)), loc: attrib(pLine, 'a_col'), size: 4 },
   ]);
 
   // 星点
@@ -850,9 +916,9 @@ function buildDecor() {
   }
   GROUP.starCount = NS;
   GROUP.stars = makeVAO([
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sp), gl.STATIC_DRAW); return b; })(), loc: attrib(pDot, 'a_pos'), size: 3 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sc), gl.STATIC_DRAW); return b; })(), loc: attrib(pDot, 'a_col'), size: 4 },
-    { buf: (() => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(ss), gl.STATIC_DRAW); return b; })(), loc: attrib(pDot, 'a_size'), size: 1 },
+    { buf: mkbuf(new Float32Array(sp)), loc: attrib(pDot, 'a_pos'), size: 3 },
+    { buf: mkbuf(new Float32Array(sc)), loc: attrib(pDot, 'a_col'), size: 4 },
+    { buf: mkbuf(new Float32Array(ss)), loc: attrib(pDot, 'a_size'), size: 1 },
   ]);
 }
 
@@ -967,7 +1033,9 @@ function mvpNow() {
   layout.distScale += (layout.tDistScale - layout.distScale) * k;
   const dist = cam.dist * layout.distScale;
   layout.dist = dist;
-  viewMatrix = M4.mul(M4.trans(0, 0, -dist), M4.mul(M4.rotX(cam.pitch), M4.rotY(cam.yaw)));
+  const jx = cam.shake ? Math.sin(performance.now() * 0.0013) * cam.shake : 0;
+  const jy = cam.shake ? Math.cos(performance.now() * 0.0009) * cam.shake * 0.6 : 0;
+  viewMatrix = M4.mul(M4.trans(0, 0, -dist), M4.mul(M4.rotX(cam.pitch + jy), M4.rotY(cam.yaw + jx)));
   projMatrix = M4.persp((38 * Math.PI) / 180, W / H, 0.1, 100);
   vpMatrix = M4.mul(M4.trans(layout.shiftX, 0, 0), M4.mul(projMatrix, viewMatrix));
 }
@@ -998,7 +1066,7 @@ function paintMemColors(time) {
     if (m.id === (selected && selected.id)) { a = 1.0; s *= 1.7; }
     col[i * 4] = c[0]; col[i * 4 + 1] = c[1]; col[i * 4 + 2] = c[2];
     col[i * 4 + 3] = a;
-    size[i] = s;
+    size[i] = s * (cam.pulse || 1);
   }
   gl.bindBuffer(gl.ARRAY_BUFFER, GROUP.memBufs.cb);
   gl.bufferData(gl.ARRAY_BUFFER, col, gl.DYNAMIC_DRAW);
@@ -1220,6 +1288,16 @@ function loop() {
   state.last = now;
   state.dt = dt;
   if (cam.spin) cam.yaw += dt * cam.spinSpeed;
+  // 「转动视角」是平滑旋到目标角度，不是瞬跳
+  if (cam.yawTarget !== null) {
+    const d = cam.yawTarget - cam.yaw;
+    if (Math.abs(d) < 0.004) { cam.yaw = cam.yawTarget; cam.yawTarget = null; }
+    else cam.yaw += d * Math.min(1, dt * 2.8);
+  }
+  // 「震动模式」除了自转，再叠一层极轻的呼吸与抖动，静止时也能看出在动
+  const sh = cam.spin ? 0.0032 : 0;
+  cam.shake = sh;
+  cam.pulse = 1 + (cam.spin ? Math.sin(t * 1.7) * 0.004 : 0);
   render(t);
   drawAura(t, dt);
   updateClock();
@@ -1406,20 +1484,40 @@ function bindUI() {
     await load(showRetired);
   };
   $('#spin').onclick = (e) => { cam.spin = !cam.spin; e.currentTarget.classList.toggle('on', cam.spin); };
-  $('#orbit').onclick = () => { cam.yaw += Math.PI / 6; };
-  $('#reset').onclick = () => { cam.yaw = 0.13; cam.pitch = 0.085; cam.dist = 2.78; };
+  $('#orbit').onclick = () => {
+    const base = cam.yawTarget === null ? cam.yaw : cam.yawTarget;
+    cam.yawTarget = base + Math.PI / 2;
+    cam.spin = false;
+    const sb = $('#spin'); if (sb) sb.classList.remove('on');
+  };
+  $('#reset').onclick = () => {
+    cam.yawTarget = null; cam.yaw = 0.13; cam.pitch = 0.085; cam.dist = 2.78;
+    cam.spin = true; const sb = $('#spin'); if (sb) sb.classList.add('on');
+  };
   const edgeL = $('#edgeL'), edgeR = $('#edgeR');
   if (edgeL) edgeL.onclick = () => { ui.left = !ui.left; uiTouched.left = true; applyCollapse(); };
   if (edgeR) edgeR.onclick = () => { ui.right = !ui.right; uiTouched.right = true; applyCollapse(); };
+  const gbtn = $('#gear');
+  if (gbtn) gbtn.onclick = () => openSettings(true);
   const fbtn = $('#focus');
-  if (fbtn) fbtn.onclick = () => { ui.focus = !ui.focus; applyCollapse(); };
+  if (fbtn) fbtn.onclick = () => {
+    ui.focus = !ui.focus;
+    applyCollapse();
+    try {
+      if (ui.focus && document.documentElement.requestFullscreen) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else if (!ui.focus && document.fullscreenElement && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+    } catch (e) { /* 嵌入或被策略拦截时忽略 */ }
+  };
   // 宿主（bundle-ui iframe）发来的指令；只接受同源
   window.addEventListener('message', (ev) => {
     // 宿主（设置页 iframe）与面板不同端口，只接受回环来源
     if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(ev.origin || '')) return;
     const d = ev.data || {};
-    if (d.type === 'mem:reload') { load(showRetired).then(() => { renderList(); renderStats(); }); }
-    else if (d.type === 'mem:settings') { location.href = '/classic'; }
+    if (d.type === 'mem:reload') refresh();
+    else if (d.type === 'mem:settings') openSettings(true);
   });
   window.addEventListener('keydown', (e) => {
     if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
@@ -1447,6 +1545,90 @@ async function load(includeRetired) {
   } catch (e) { /* 静默：离线打开时用内嵌数据 */ }
 }
 
+function setStatus(msg, bad) {
+  const el = $('#s-status');
+  if (el) { el.textContent = msg || ''; el.style.color = bad ? '#F87171' : 'var(--muted)'; }
+}
+
+async function openSettings(force) {
+  const box = $('#settings');
+  if (!box) return;
+  if (!force && box.classList.contains('open')) { box.classList.remove('open'); return; }
+  box.classList.add('open');
+  try {
+    const r = await fetch('/api/settings');
+    const st = await r.json();
+    const llm = (st && st.llm) || {};
+    $('#s-base').value = llm.base || '';
+    $('#s-model').value = llm.model || '';
+    $('#s-key').value = '';
+    setStatus('配置保存在 memory/config.json，密钥写入 secrets.json（0600，不回显）');
+  } catch (e) { setStatus('读取设置失败：' + e.message, true); }
+}
+
+function bindSettings() {
+  const close = $('#setClose');
+  if (close) close.onclick = () => $('#settings').classList.remove('open');
+  const save = $('#s-save');
+  if (save) save.onclick = async () => {
+    const body = { llm: { base: $('#s-base').value.trim() || null, model: $('#s-model').value.trim() || null } };
+    const key = $('#s-key').value.trim();
+    if (key) body.llm.key = key;
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      setStatus(j.error ? ('保存失败：' + j.error) : '已保存', !!j.error);
+      if (!j.error) $('#s-key').value = '';
+    } catch (e) { setStatus('保存失败：' + e.message, true); }
+  };
+  const test = $('#s-test');
+  if (test) test.onclick = async () => {
+    setStatus('正在连接…');
+    try {
+      const r = await fetch('/api/llm/test', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base: $('#s-base').value.trim(), model: $('#s-model').value.trim(),
+                               key: $('#s-key').value.trim() }),
+      });
+      const j = await r.json();
+      setStatus(j.ok ? ('连接正常，可用模型 ' + ((j.models || []).length) + ' 个')
+                     : ('连接失败：' + (j.error || '未知错误')), !j.ok);
+    } catch (e) { setStatus('连接失败：' + e.message, true); }
+  };
+  document.querySelectorAll('#settings .acts button[data-act]').forEach((b) => {
+    b.onclick = async () => {
+      const act = b.dataset.act;
+      setStatus('执行中…');
+      try {
+        const r = await fetch('/api/action', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: act }),
+        });
+        const j = await r.json();
+        if (j.error) { setStatus(j.error, true); return; }
+        setStatus('完成 · ' + JSON.stringify(j.result || {}).slice(0, 80));
+        if (act === 'forget' || act === 'relink' || act === 'maintain') refresh();
+      } catch (e) { setStatus('失败：' + e.message, true); }
+    };
+  });
+}
+
+async function refresh() {
+  const keep = { yaw: cam.yaw, pitch: cam.pitch, dist: cam.dist };
+  await load(showRetired);
+  disposeSinceMark();
+  buildMemories();
+  buildDecor();
+  markScene();
+  cam.yaw = keep.yaw; cam.pitch = keep.pitch; cam.dist = keep.dist;
+  selected = null; hovered = null;
+  renderKinds(); renderStats(); renderList();
+  const ld = $('#loading');
+  if (ld) { ld.classList.remove('done'); setTimeout(() => ld.classList.add('done'), 90); }
+}
+
 async function boot() {
   if (EMBEDDED) { DATA.nodes = EMBEDDED.nodes || []; DATA.edges = EMBEDDED.edges || []; }
   if (!DATA.nodes.length) await load(false);
@@ -1454,12 +1636,14 @@ async function boot() {
   // 先让遮罩上屏，再做点云/纤维构建（1~3 秒），避免新窗口打开时误判为白屏
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   buildShell();
+  markScene();
   buildMemories();
   buildDecor();
   renderKinds();
   renderStats();
   renderList();
   bindUI();
+  bindSettings();
   // 恢复用户手动设置；自动折叠不写盘，避免污染
   try {
     const saved = JSON.parse(localStorage.getItem('mem-nebula-ui') || 'null');
@@ -1477,6 +1661,7 @@ async function boot() {
   window.addEventListener('resize', () => { resize(); autoFit(); updateLayout(); });
   if (!memNodes.length) $('#empty').style.display = 'block';
   clock0 = Date.now();
+  window.__cam = cam;            // 便于自测/排障：只读观察相机状态
   requestAnimationFrame(loop);
   const ld = $('#loading');
   if (ld) setTimeout(() => ld.classList.add('done'), 60);

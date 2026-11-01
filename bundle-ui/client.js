@@ -15,7 +15,6 @@ window.__ModuleLoader__.load({
     function MemorySection() {
       const [src, setSrc] = useState('');
       const [base, setBase] = useState('');
-      const [copied, setCopied] = useState(false);
       const [failed, setFailed] = useState(false);
       const frame = useRef(null);
 
@@ -82,16 +81,6 @@ window.__ModuleLoader__.load({
           h('span', { style: title }, '记忆星云'),
           h('button', { style: btn, onClick: () => send('mem:reload') }, '刷新'),
           h('button', { style: btn, onClick: () => send('mem:settings') }, '设置'),
-          src ? h('button', {
-            style: btn,
-            onClick: async () => {
-              try {
-                await navigator.clipboard.writeText(base || 'http://127.0.0.1:8790/');
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1600);
-              } catch (e) { /* 剪贴板不可用时忽略 */ }
-            },
-          }, copied ? '已复制' : '复制链接') : null,
           src ? h('a', {
             href: base || 'http://127.0.0.1:8790/', target: '_blank', rel: 'noreferrer',
             style: { ...btn, textDecoration: 'none' },
@@ -99,7 +88,6 @@ window.__ModuleLoader__.load({
         ),
         src ? h('iframe', {
           ref: frame, src, title: '记忆星云',
-          sandbox: 'allow-scripts allow-same-origin allow-forms allow-downloads',
           style: { flex: 1, width: '100%', minHeight: 520, border: '1px solid rgba(255,255,255,.14)', borderRadius: 12, background: 'transparent' },
         }) : h('div', { style: { width: '100%', height: 260, borderRadius: 12, background: 'rgba(255,255,255,.06)', border: '1px solid #272727' } }),
       );
