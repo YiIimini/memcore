@@ -127,11 +127,11 @@ h1 em{font-style:normal;color:var(--gold-hi);
 #dock button.on{color:var(--gold-hi);background:rgba(255,197,107,.11)}
 
 /* ---------- 紧凑顶栏（小窗口 / 设置页 iframe） ---------- */
-#compact{position:fixed;z-index:11;left:0;right:0;top:0;height:44px;padding:0 12px;
+#compact{position:fixed;z-index:15;left:0;right:0;top:0;height:44px;padding:0 12px;
   display:none;align-items:center;gap:10px;
   background:linear-gradient(180deg,rgba(8,13,22,.92),rgba(8,13,22,.55) 70%,transparent);
   backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
-body.compact #compact{display:flex}
+body.rails-hidden #compact{display:flex}
 #compact .cb{display:flex;align-items:baseline;gap:8px;margin-right:auto;min-width:0}
 #compact .cb b{font-size:13px;font-weight:400;letter-spacing:.10em;
   font-family:"Xingkai SC","STKaiti",serif;color:#DCE7F7;white-space:nowrap}
@@ -705,7 +705,7 @@ function attrib(p, name) { return gl.getAttribLocation(p, name); }
    ============================================================ */
 const GROUP = { shellDots: null, shellLines: null, memLines: null, memDots: null, flow: null, rings: null, stars: null };
 const memNodes = [];   // {id,title,kind,x,y,z,size,col,deg,sal}
-const cam = { yaw: 0.13, pitch: 0.085, dist: 2.78, spin: true, spinSpeed: 0.11,
+const cam = { yaw: 0.13, pitch: 0.085, zoom: 1, spin: true, spinSpeed: 0.11,
   yawTarget: null, shake: 0, pulse: 1 };
 let hovered = null, selected = null, query = '', activeKinds = null, showRetired = false;
 let projScale = 1000, W = 1, H = 1, DPR = 1;
@@ -1056,15 +1056,15 @@ function autoFit() {
   if (compact) {
     if (!uiTouched.right && !ui.right) { ui.right = true; changed = true; }
     if (!uiTouched.left && !ui.left) { ui.left = true; changed = true; }
-  } else {
-    if (!uiTouched.right) { const want = w < 1000; if (want !== ui.right) { ui.right = want; changed = true; } }
-    if (!uiTouched.left) { const want = w < 820; if (want !== ui.left) { ui.left = want; changed = true; } }
   }
+  // 非紧凑尺寸下不再自动展开两栏：默认就是只显示光脑，
+  // 由用户从顶栏或边缘把手打开，打开后一直保持。
   if (changed) applyCollapse();
   const st = document.querySelector('#cstat');
   if (st) st.textContent = memNodes.filter((m) => m.id !== '__me__').length + ' 条记忆';
 }
-const layout = { shiftX: 0, distScale: 1, dist: 2.78, tShiftX: 0, tDistScale: 1 };
+const BRAIN_W = 2.22, BRAIN_H = 1.98;   // 含光环与余量的包围盒（世界单位）
+const layout = { shiftX: 0, dist: 3.2, tShiftX: 0, tDist: 3.2 };
 
 function updateLayout() {
   const L = document.querySelector('#left');
@@ -1075,10 +1075,14 @@ function updateLayout() {
   const rw = hideR ? 0 : (R && R.offsetWidth ? R.offsetWidth + 20 : 0);
   const avail = Math.max(300, W - lw - rw);
   layout.tShiftX = ((lw + (W - rw)) / 2 - W / 2) / (W / 2);
-  // 侧栏越少，画面越开阔；两个基准点：双栏 1.22、全宽 1.39
-  const fill = clamp((avail / W - 0.5) / 0.5, 0, 1);
-  // 小窗口里画面本来就只有几百像素，再拉远就看不见了
-  layout.tDistScale = ui.compact ? (1.02 + 0.14 * fill) : (1.22 + 0.17 * fill);
+  // 直接按"大脑包围盒刚好放进可用区域"反解相机距离：
+  // 竖长窗口按宽度贴边，宽屏按高度贴边，两边都留一点余量。
+  const availW = Math.max(240, W - lw - rw);
+  const availH = Math.max(200, H);
+  const projCss = H / (2 * Math.tan((38 * Math.PI / 180) / 2));
+  const dW = (BRAIN_W * projCss) / (availW * 0.94);
+  const dH = (BRAIN_H * projCss) / (availH * 0.86);
+  layout.tDist = Math.max(1.6, Math.max(dW, dH));
   const root = document.documentElement;
   root.style.setProperty('--scene-shift', (layout.tShiftX * W / 2).toFixed(1) + 'px');
   root.style.setProperty('--rail-right', (hideR ? 0 : (R && R.offsetWidth ? R.offsetWidth + 20 : 0)) + 'px');
@@ -1088,6 +1092,7 @@ function applyCollapse() {
   document.body.classList.toggle('right-collapsed', ui.right);
   document.body.classList.toggle('focus-mode', ui.focus);
   document.body.classList.toggle('compact', ui.compact);
+  document.body.classList.toggle('rails-hidden', ui.left && ui.right && !ui.focus);
   const cl = document.querySelector('#cList'), cs = document.querySelector('#cSearch');
   if (cl) cl.classList.toggle('on', !ui.right);
   if (cs) cs.classList.toggle('on', !ui.left);
@@ -1108,9 +1113,8 @@ function mvpNow() {
   // 相机随侧栏状态平滑过渡，避免跳变
   const k = clamp((state.dt || 0.016) * 6.5, 0.02, 1);
   layout.shiftX += (layout.tShiftX - layout.shiftX) * k;
-  layout.distScale += (layout.tDistScale - layout.distScale) * k;
-  const dist = cam.dist * layout.distScale;
-  layout.dist = dist;
+  layout.dist += (layout.tDist - layout.dist) * k;
+  const dist = layout.dist * (cam.zoom || 1);
   const jx = cam.shake ? Math.sin(performance.now() * 0.0013) * cam.shake : 0;
   const jy = cam.shake ? Math.cos(performance.now() * 0.0009) * cam.shake * 0.6 : 0;
   viewMatrix = M4.mul(M4.trans(0, 0, -dist), M4.mul(M4.rotX(cam.pitch + jy), M4.rotY(cam.yaw + jx)));
@@ -1451,7 +1455,7 @@ canvas.addEventListener('pointerup', (e) => {
 canvas.addEventListener('pointerleave', () => { hovered = null; hideBubble(); });
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  cam.dist = clamp(cam.dist * (e.deltaY > 0 ? 1.08 : 0.925), 1.7, 8);
+  cam.zoom = clamp((cam.zoom || 1) * (e.deltaY > 0 ? 1.08 : 0.925), 0.45, 2.6);
 }, { passive: false });
 
 function showBubble(m, x, y) {
@@ -1569,7 +1573,7 @@ function bindUI() {
     const sb = $('#spin'); if (sb) sb.classList.remove('on');
   };
   $('#reset').onclick = () => {
-    cam.yawTarget = null; cam.yaw = 0.13; cam.pitch = 0.085; cam.dist = 2.78;
+    cam.yawTarget = null; cam.yaw = 0.13; cam.pitch = 0.085; cam.zoom = 1;
     cam.spin = true; const sb = $('#spin'); if (sb) sb.classList.add('on');
   };
   const edgeL = $('#edgeL'), edgeR = $('#edgeR');
@@ -1727,6 +1731,10 @@ async function boot() {
   bindUI();
   bindSettings();
   // 恢复用户手动设置；自动折叠不写盘，避免污染
+  // 默认只看光脑：两栏收起，顶栏与边缘把手作为入口。
+  // 之后以用户的显式操作为准（localStorage）。
+  ui.left = true;
+  ui.right = true;
   try {
     const saved = JSON.parse(localStorage.getItem('mem-nebula-ui') || 'null');
     if (saved && typeof saved === 'object') {
