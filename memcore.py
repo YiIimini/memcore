@@ -494,6 +494,12 @@ class Memory:
         """One-shot routine: ingest new sessions, add edges, gc, rebuild mirror."""
         ing = self.ingest_sessions()
         edges = self.relink(rebuild=False)
+        # 先落快照再执行破坏性 gc：否则误判只能对着「删完之后」的库叹气
+        pre = None
+        try:
+            pre = self.backup()
+        except Exception:  # noqa: BLE001
+            pre = None
         g = self.gc(dry_run=False)
         self.export_markdown()
         brief = self.brief(budget_tokens=700)
@@ -523,10 +529,29 @@ class Memory:
             self.db.commit()
 
     def _next_id(self) -> str:
-        row = self.db.execute("SELECT v FROM meta WHERE k='seq'").fetchone()
-        n = int(row["v"]) + 1 if row else 1
-        self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seq',?)", (str(n),))
-        return "M%05d" % n
+        """Reserve the next sequence number atomically.
+
+        读-改-写在两个进程之间会读到同一个值，第二个写入撞 PRIMARY KEY
+        （实测 4×40 并发只落 110 行）。这里用单语句自增，必要时回退重试。
+        """
+        try:
+            with self.db:
+                row = self.db.execute(
+                    "UPDATE meta SET v = CAST(v AS INTEGER) + 1 WHERE k='seq' RETURNING v"
+                ).fetchone()
+                if row is None:
+                    self.db.execute("INSERT OR IGNORE INTO meta(k,v) VALUES('seq','0')")
+                    row = self.db.execute(
+                        "UPDATE meta SET v = CAST(v AS INTEGER) + 1 WHERE k='seq' RETURNING v"
+                    ).fetchone()
+            return "M%05d" % int(row[0])
+        except (sqlite3.OperationalError, TypeError):
+            # SQLite < 3.35 没有 RETURNING：退回到加锁的读改写
+            with self.db:
+                row = self.db.execute("SELECT v FROM meta WHERE k='seq'").fetchone()
+                n = int(row["v"]) + 1 if row else 1
+                self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('seq',?)", (str(n),))
+            return "M%05d" % n
 
     # -- write ------------------------------------------------------------
     def add(
@@ -558,7 +583,7 @@ class Memory:
         if salience is None:
             salience = KIND_DEFAULTS[kind][0]
         tags = [t.strip().lower() for t in tags if t and t.strip()]
-        h = sha1("%s|%s|%s" % (kind, title, body))
+        h = sha1("%s|%s|%s|%s" % (kind, project or "", title, body))
 
         if dedupe and self.cfg.get("dedupe_exact", True):
             row = self.db.execute(
@@ -584,7 +609,7 @@ class Memory:
 
         v = embed(title + "\n" + body, self.dim)
         if dedupe and self.cfg.get("dedupe_fuzzy", 0) > 0:
-            dup = self._fuzzy_duplicate(kind, v)
+            dup = self._fuzzy_duplicate(kind, v, project)
             if dup:
                 self.reinforce(dup)
                 return {"id": dup, "deduped": "fuzzy"}
@@ -630,6 +655,13 @@ class Memory:
                 v = norm_text(v)
             if k == "pinned":
                 v = 1 if v else 0
+            if k == "tags":
+                # 标签写 tags 表，同时把 memories.tags 同步成逗号串；
+                # 直接把 list 绑进 TEXT 列会抛 InterfaceError（标签因此永远改不动）
+                tags_norm = [str(t).strip().lower() for t in v if str(t).strip()]
+                sets.append("tags=?")
+                vals.append(",".join(tags_norm))
+                continue
             sets.append("%s=?" % k)
             vals.append(v)
         if not sets:
@@ -653,7 +685,8 @@ class Memory:
             if (self.db.execute("SELECT status FROM memories WHERE id=?", (mid,)).fetchone()
                     or {"status": "active"})["status"] == "active":
                 self.db.execute("UPDATE memories SET hash=? WHERE id=?",
-                                (sha1("%s|%s|%s" % (r["kind"], r["title"], r["body"])), mid))
+                                (sha1("%s|%s|%s|%s" % (r["kind"], r["project"] or "",
+                                                       r["title"], r["body"])), mid))
             self.db.execute("UPDATE memories SET sim=? WHERE id=?",
                             (simhash(r["title"] + "\n" + r["body"]), mid))
         self._journal("update", mid, {k: v for k, v in fields.items() if k != "body"})
@@ -1021,8 +1054,16 @@ class Memory:
         for h in hits:
             line = self._format_hit(h, compact=compact)
             cost = est_tokens(line)
-            if used + cost > budget_tokens and items:
-                break
+            remaining = budget_tokens - used
+            if cost > remaining:
+                # 单条太大就截断正文塞进去；确实塞不下才跳过（不是整段 break）
+                line = self._format_hit(h, compact=compact, max_chars=max(60, remaining * 3))
+                cost = est_tokens(line)
+                if cost > remaining:
+                    if items:
+                        continue
+                    line = line[: max(20, remaining)]
+                    cost = est_tokens(line)
             items.append({"id": h["id"], "line": line, "score": h["score"]})
             used += cost
             self.reinforce(h["id"], 0.01)
@@ -1034,13 +1075,11 @@ class Memory:
         return {"text": text, "items": items, "tokens": used, "hits": len(hits)}
 
     @staticmethod
-    def _format_hit(h: Dict[str, Any], compact: bool = False) -> str:
+    def _format_hit(h: Dict[str, Any], compact: bool = False, max_chars: Optional[int] = None) -> str:
         day = time.strftime("%Y-%m-%d", time.localtime(h["created_at"]))
         body = re.sub(r"\s+", " ", h["body"])
-        if compact:
-            body = body[:110] + ("…" if len(body) > 110 else "")
-        else:
-            body = body[:240] + ("…" if len(body) > 240 else "")
+        cap = int(max_chars) if max_chars else (110 if compact else 240)
+        body = body[:cap] + ("…" if len(body) > cap else "")
         star = "★" if h["pinned"] else ""
         return "[%s] %s%s %s %s (%.2f) — %s — %s" % (
             h["id"], star, h["kind"], h["project"] or "-", day, h["score"], h["title"], body)
@@ -1133,13 +1172,14 @@ class Memory:
         return [dict(r) for r in self.db.execute(sql, params)]
 
     # -- maintenance ------------------------------------------------------
-    def _fuzzy_duplicate(self, kind: str, v: bytes) -> Optional[str]:
+    def _fuzzy_duplicate(self, kind: str, v: bytes, project: str = "") -> Optional[str]:
         thr = float(self.cfg.get("dedupe_fuzzy", 0.965))
         nv = vec_of(v, self.dim)
+        # 同一句话写进不同项目是两条事实，不能合并掉归属
         for r in self.db.execute(
                 "SELECT m.id, x.v FROM vectors x JOIN memories m ON m.id=x.memory_id "
-                "WHERE m.kind=? AND m.status='active' AND m.valid_to=0 "
-                "ORDER BY m.updated_at DESC LIMIT 4000", (kind,)):
+                "WHERE m.kind=? AND m.status='active' AND m.valid_to=0 AND m.project=? "
+                "ORDER BY m.updated_at DESC LIMIT 4000", (kind, project or "")):
             if cosine(nv, vec_of(r["v"], self.dim)) >= thr:
                 return r["id"]
         return None
@@ -1538,7 +1578,7 @@ class Memory:
                 action, verdict = "review", None
                 if sim >= dup_sim:
                     action = "merge"
-                elif llm:
+                elif llm and not dry_run:
                     verdict, note = self._llm_judge(older, newer)
                     if verdict:
                         rel = verdict.get("relation")

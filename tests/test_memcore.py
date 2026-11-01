@@ -263,6 +263,31 @@ class TestGraphFeatures(Base):
         b = self.m.add("端口 8080 用于本地预览", title="预览端口", kind="fact")
         self.assertNotEqual(b["id"], a["id"])
 
+
+    def test_concurrent_add_does_not_lose_writes(self):
+        """并发取号必须原子：读-改-写会让两个进程拿到同一个 ID 并撞主键。"""
+        import threading
+        errs = []
+
+        def worker(n):
+            m = Memory(self.home)          # 每条线程独立连接
+            try:
+                for i in range(20):
+                    m.add("并发 %d-%d 的内容" % (n, i), title="并发 %d-%d" % (n, i),
+                          kind="note", dedupe=False)
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+            finally:
+                m.close()
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errs, [])
+        self.assertEqual(Memory(self.home).stats()["total"], 80)
+
     def test_retire_keeps_existing_meta(self):
         mid = self.m.add("带元信息的条目", title="元信息", kind="todo", meta={"done": False, "prio": 3})["id"]
         self.m.retire(mid, reason="改用别的方案")
