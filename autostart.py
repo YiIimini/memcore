@@ -110,6 +110,7 @@ def enable_ui(port: int = 8790, home: str = "") -> dict:
         "StandardErrorPath": os.path.join(LOG_DIR, "MemoryPanel.log"),
         "EnvironmentVariables": {"PATH": PATH, "HOME": HOME, **({"MEM_HOME": home} if home else {})},
         "ProcessType": "Interactive",
+        "ThrottleInterval": 10,   # 崩溃时别无限重启
     }
     _write(PANEL_PLIST, payload)
     r = _load(PANEL_PLIST, PANEL_LABEL)
@@ -179,7 +180,9 @@ def status() -> dict:
     return {"panel": ui_status(), "maintain": maintain_status()}
 
 
-def ui_status() -> dict:
+def ui_status(probe: bool = True) -> dict:
+    """probe=False 用于"我就是面板"的场景：否则 /api/stats 会探测自己，
+    再触发一次 /api/stats，形成无限自递归并耗尽 fd。"""
     loaded = _loaded(PANEL_LABEL)
     port = 8790
     try:
@@ -189,7 +192,7 @@ def ui_status() -> dict:
                 port = int(args[args.index("--port") + 1])
     except Exception:
         pass
-    alive = _alive("http://127.0.0.1:%d/api/stats" % port)
+    alive = _alive("http://127.0.0.1:%d/api/stats" % port) if probe else None
     return {"label": PANEL_LABEL, "name": "记忆面板", "desc": "常驻的图表/设置界面",
             "enabled": bool(loaded and alive), "loaded": loaded, "alive": alive,
             "port": port, "url": "http://127.0.0.1:%d/" % port, "plist": PANEL_PLIST}
@@ -212,7 +215,7 @@ def maintain_status() -> dict:
 def agents(panel_alive=None) -> list:
     """panel_alive: pass True when called from inside the panel server itself
     (avoids a self-probe that can race its own startup)."""
-    p = ui_status()
+    p = ui_status(probe=panel_alive is None)
     if panel_alive is not None:
         p["alive"] = bool(panel_alive)
         p["enabled"] = bool(p["loaded"] and p["alive"])

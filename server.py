@@ -124,9 +124,18 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
     def state():
         if autostart is None:
             return {"agents": [], "autostart": {"enabled": False, "supported": False}, "settings": {}}
-        return {"agents": autostart.agents(panel_alive=True),
-                "autostart": autostart.ui_status(),
-                "settings": mem.settings()}
+        # 后台任务状态 3 秒缓存：每次请求都 fork launchctl 会拖慢面板并堆积 fd
+        now = time.time()
+        with lock:
+            cached = cache.get("state")
+        if cached and now - cached[0] < 3:
+            return cached[1]
+        out = {"agents": autostart.agents(panel_alive=True),
+               "autostart": autostart.ui_status(probe=False),
+               "settings": mem.settings()}
+        with lock:
+            cache["state"] = (now, out)
+        return out
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "memcore/1.1"
@@ -261,7 +270,7 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                                     _int(auto.get("interval_minutes", 30), 30, 5, 1440), m.home)
                             else:
                                 out["autostart"] = autostart.disable()
-                        self._json({"ok": True, "settings": out, "agents": autostart.agents()})
+                        self._json({"ok": True, "settings": out, "agents": autostart.agents(panel_alive=True)})
                     else:
                         self._json({"ok": True, "settings": out, "agents": []})
                 else:
@@ -319,16 +328,16 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                     r = autostart.enable(interval, m.home)
                 else:
                     r = autostart.disable()
-                self._json({"ok": True, "result": r, "agents": autostart.agents()})
+                self._json({"ok": True, "result": r, "agents": autostart.agents(panel_alive=True)})
             elif name == "panel_on":
                 self._json({"ok": True, "result": autostart.enable_ui(port, m.home),
-                            "agents": autostart.agents()})
+                            "agents": autostart.agents(panel_alive=True)})
             elif name == "panel_off":
                 # 先回响应，再异步 bootout：否则调用方永远等不到这个 200
                 from threading import Timer
                 Timer(0.8, autostart.disable_ui).start()
                 self._json({"ok": True, "result": {"disabled": True},
-                            "agents": autostart.agents()})
+                            "agents": autostart.agents(panel_alive=True)})
             else:
                 self._json({"error": "unknown action: %s" % name}, 400)
 

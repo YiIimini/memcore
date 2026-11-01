@@ -48,7 +48,11 @@ window.__ModuleLoader__.load({
               if (timer) clearTimeout(timer);
               if (!r.ok) continue;
               const j = await r.json();
-              if (!j || j.app !== 'memcore') continue;
+              // 指纹优先认 app 字段；旧版面板没有这个字段，用 stats 的固有形状兜底，
+              // 否则「服务明明在跑」也会被判成没运行
+              const isMemcore = !!j && (j.app === 'memcore' ||
+                (typeof j.total === 'number' && typeof j.home === 'string' && typeof j.db === 'string'));
+              if (!isMemcore) continue;
               if (alive) {
                 setBase('http://127.0.0.1:' + p + '/');
                 setSrc('http://127.0.0.1:' + p + '/?embed=1' + q);
@@ -72,8 +76,12 @@ window.__ModuleLoader__.load({
       const title = { fontSize: 14, lineHeight: '20px', fontWeight: 600, marginRight: 'auto' };
 
       if (failed) {
-        return h('div', { style: { padding: 16, fontSize: 14, lineHeight: '20px' } },
-          '记忆面板服务没有运行。打开终端执行 mem serve，或双击桌面的「记忆面板」后回来刷新。');
+        return h('div', { style: { padding: 16, fontSize: 14, lineHeight: '22px' } },
+          h('div', { style: { fontWeight: 600, marginBottom: 6 } }, '记忆面板服务没有运行'),
+          h('div', { style: { opacity: .7, fontSize: 13 } }, '在终端执行下面任一条，然后点「重试」：'),
+          h('pre', { style: { margin: '8px 0', padding: '8px 10px', borderRadius: 8,
+            background: 'rgba(255,255,255,.06)', fontSize: 12 } }, 'mem serve --open'),
+          h('button', { style: btn, onClick: () => { setFailed(false); window.location.reload(); } }, '重试'));
       }
 
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12, height: '100%' } },
