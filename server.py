@@ -171,11 +171,17 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             if ctype.startswith("text/html"):
+                # 这个面板要嵌在 Harness 的 Electron 页面里，而那边的 origin 既不是
+                # http://127.0.0.1:* 也不一定可枚举（可能是 file: 或 null）。原先的
+                # frame-ancestors 白名单会把 iframe 直接拒绝，表现为一片空白。
+                # 于是这里不限制嵌入来源，其余指令仍按回环与内联资源收紧。
                 self.send_header(
                     "Content-Security-Policy",
-                    "default-src 'self'; img-src 'self' data:; font-src 'self' data:; "
+                    "default-src 'self' http://127.0.0.1:* http://localhost:* data:; "
+                    "img-src 'self' data: http://127.0.0.1:* http://localhost:*; "
+                    "font-src 'self' data:; "
                     "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
-                    "connect-src 'self'; frame-ancestors 'self' http://127.0.0.1:* http://localhost:*",
+                    "connect-src 'self' http://127.0.0.1:* http://localhost:*",
                 )
             self._cors()
             self.end_headers()
