@@ -164,8 +164,18 @@ class PanelSecurity(unittest.TestCase):
         code, hdrs, _ = self.req("GET", "/")
         self.assertEqual(code, 200)
         self.assertEqual(hdrs.get("X-Content-Type-Options"), "nosniff")
-        self.assertIn("Content-Security-Policy", hdrs)
-        self.assertIn("frame-ancestors", hdrs.get("Content-Security-Policy", ""))
+        csp = hdrs.get("Content-Security-Policy", "")
+        self.assertTrue(csp, "应下发 CSP")
+        # 不限制嵌入来源：面板要嵌进 Harness 的 Electron 页面（origin 可能是 file:/null），
+        # frame-ancestors 白名单会让 iframe 直接显示空白
+        self.assertNotIn("frame-ancestors", csp)
+
+    def test_favicon_beacon_for_host_probe(self):
+        """宿主页用 <img> 判活，需要一个不受 CORS 约束的 200 响应。"""
+        code, hdrs, body = self.req("GET", "/favicon.ico")
+        self.assertEqual(code, 200)
+        self.assertTrue(hdrs.get("Content-Type", "").startswith("image/png"))
+        self.assertGreater(len(body), 0)
 
     def test_unknown_route_is_404(self):
         code, _, _ = self.req("GET", "/api/nope")
