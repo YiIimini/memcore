@@ -169,6 +169,8 @@ $M stats --json
 
 ## 5. 三种调用形态
 
+> 装到自己机器上时，`bundle-mcp/cordis.patch.yml` 里的 `args` 路径要改成你的实际安装位置。
+
 1. **CLI**（永远可用）：`mem recall ...`，就是普通 bash 调用。
 2. **MCP 工具**（原生 tool calling）：
    ```json

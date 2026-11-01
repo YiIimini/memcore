@@ -1240,8 +1240,9 @@ class Memory:
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "sessions_dump.js")
         if not os.path.exists(helper) or not os.path.exists(root):
             return {"sessions": 0, "added": 0, "note": "no sessions root or helper"}
+        home = os.path.expanduser("~")
         node = shutil.which("node") or next(
-            (p for p in ("/Users/x/.local/bin/node", "/opt/homebrew/bin/node",
+            (p for p in (os.path.join(home, ".local/bin/node"), "/opt/homebrew/bin/node",
                          "/usr/local/bin/node", "/usr/bin/node") if os.path.exists(p)), "node")
         env = dict(os.environ)
         env["PATH"] = os.pathsep.join([os.path.dirname(node), env.get("PATH", "/usr/bin:/bin")])

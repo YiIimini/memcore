@@ -3,7 +3,7 @@
 
 Wire it into any MCP client:
   command: python3
-  args: ["/Users/x/.dsh/memory-core/mem_mcp.py"]
+  args: ["<你的路径>/memory-core/mem_mcp.py"]
 
 Protocol: JSON-RPC 2.0 over stdio, newline-delimited JSON (Content-Length
 framing is also accepted). Tools: memory_search, memory_recall, memory_brief,

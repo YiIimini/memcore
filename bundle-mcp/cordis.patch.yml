@@ -4,7 +4,7 @@
       config:
         serverName: memory
         transport: stdio
-        command: /usr/bin/python3
+        command: python3
         args:
           - /Users/x/.dsh/memory-core/mem_mcp.py
         failOnStartupError: false
