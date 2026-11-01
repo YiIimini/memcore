@@ -259,23 +259,47 @@ body.embed h1{font-size:17px;line-height:26px}
 body.embed .nums b{font-size:16px}
 body.embed #dock{bottom:14px;transform:translateX(-50%) scale(.92)}
 body.embed #conn{bottom:16px;right:16px}
+/* 注意：这里不要用 display:none 藏右栏——紧凑模式下它是可开合的浮层，
+   藏在 CSS 里会让顶栏的「列」按钮点了没反应 */
 @media (max-width:760px){
-  body.embed #right{display:none}
   body.embed #left{width:190px}
 }
 
 
 /* ---------- 紧凑模式定位（放在最后，压过 body.embed 的默认值） ---------- */
-body.compact #compact{z-index:13}
+body.compact #compact{z-index:15}
 body.compact #left,body.compact.embed #left{
-  top:52px;bottom:52px;left:10px;width:236px;z-index:14}
+  top:52px;bottom:52px;left:10px;width:236px;z-index:12}
 body.compact #right,body.compact.embed #right{
-  top:52px;bottom:52px;right:10px;width:272px;padding-top:12px;z-index:14}
+  top:52px;bottom:52px;right:10px;width:272px;padding-top:12px;z-index:12}
 body.compact #left .sig,body.compact #left h1{display:none}
 body.compact #dock,body.compact.embed #dock{bottom:12px;transform:translateX(-50%) scale(.9)}
 @media (max-width:640px){
   body.compact #left,body.compact.embed #left{width:200px}
   body.compact #right,body.compact.embed #right{width:236px}
+}
+
+/* 设置页内容区可能只有两三百像素：侧栏改成整宽覆盖层，顶栏永远压在最上面 */
+@media (max-width:520px){
+  body.compact #left,body.compact.embed #left{
+    left:7px;right:auto;top:50px;bottom:54px;width:calc(100% - 14px);max-width:none}
+  body.compact #right,body.compact.embed #right{
+    left:7px;right:7px;width:auto;top:50px;bottom:54px;max-width:none}
+  body.compact #compact{padding:0 7px;gap:6px}
+  body.compact #compact .cb span{display:none}
+  body.compact #compact .ci{width:26px;height:26px;border-radius:8px}
+  body.compact .tabs{gap:2px;padding-right:4px}
+  body.compact .tabs button{font-size:10px;letter-spacing:.02em;padding:5px 0}
+  body.compact .mem{padding:7px 9px}
+  body.compact .mem .t{font-size:12px;line-height:17px}
+  body.compact #left h1{font-size:17px;line-height:25px}
+  body.compact .nums b{font-size:16px}
+  body.compact #settings{left:7px;right:7px;width:auto;top:50px}
+}
+@media (max-width:380px){
+  body.compact #compact .cb b{font-size:11px}
+  body.compact #dock{padding:4px;gap:0}
+  body.compact #dock button{padding:6px 8px;font-size:10.5px;letter-spacing:0}
 }
 </style>
 </head>
