@@ -131,6 +131,13 @@ h1 em{font-style:normal;color:var(--gold-hi);
   background:linear-gradient(160deg,rgba(52,34,18,.46),rgba(16,12,10,.28))}
 .mem.pit .t{color:#FFC46B}
 .mem.pit .pf{margin-top:4px;font-size:11px;line-height:1.5;color:var(--muted)}
+.fbar{display:flex;gap:5px;align-items:center;margin-bottom:6px}
+.fbar input{flex:1;min-width:0;padding:5px 8px;border-radius:8px;font-size:11.5px;
+  background:rgba(10,18,30,.72);border:1px solid var(--line);color:var(--fg)}
+.fbar input:focus{outline:none;border-color:var(--line-2)}
+.fbtn{display:flex;gap:6px;margin-top:5px}
+.fbtn button{font-size:10px;padding:2px 7px;border-radius:6px;cursor:pointer;
+  background:rgba(120,180,255,.10);border:1px solid rgba(120,180,255,.28);color:#cfe6ff}
 .pitb{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:6px;font-size:10px;letter-spacing:.08em;
   color:#FFC46B;border:1px solid rgba(255,180,120,.35);background:rgba(255,180,120,.10);vertical-align:middle}
 #list{flex:1;overflow:auto;display:flex;flex-direction:column;gap:7px;padding-right:8px;isolation:isolate;
@@ -409,6 +416,7 @@ body.compact #dock,body.compact.embed #dock{bottom:12px;transform:translateX(-50
     <button data-tab="tech">技术</button>
     <button data-tab="sleep">沉睡</button>
     <button data-tab="pit">雷区</button>
+    <button data-tab="file">文件</button>
     <button data-tab="old">旧痕</button>
     <button data-tab="eval">评估</button>
   </div>
@@ -1934,6 +1942,117 @@ function renderSleepList(box) {
   });
 }
 
+/* ---------------- 文件：本机工作区索引（借 arcdream-hub 的工作区登记） ---------------- */
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+let fileQ = '', fileMode = 'all', fileResults = null, fileTimer = null, fileBusy = false;
+
+let fileStatus = null;
+async function loadFiles(reset) {
+  if (fileBusy) return;
+  fileBusy = true;
+  try {
+    if (!fileQ) {
+      try { fileStatus = await (await fetch('/api/files/status')).json(); } catch (e) { fileStatus = null; }
+      fileResults = [];
+      fileResults._total = 0;
+      return;
+    }
+    const u = new URLSearchParams({ q: fileQ, mode: fileMode, limit: '30' });
+    const r = await fetch('/api/files/search?' + u.toString());
+    const j = await r.json();
+    fileResults = (j && Array.isArray(j.results)) ? j.results : [];
+    fileResults._total = (j && j.total) || 0;
+  } catch (e) {
+    fileResults = [];
+    fileResults._total = 0;
+  } finally {
+    fileBusy = false;
+    if (tab === 'file') renderList();
+  }
+}
+
+function renderFileList(box) {
+  const head = '<div class="fbar"><input id="fq" placeholder="搜本机文件（名字或正文）" value="' +
+      esc(fileQ) + '" autocomplete="off">' +
+      [['all', '全部'], ['name', '名字'], ['content', '正文']].map(([k, label]) =>
+        '<button class="mini' + (fileMode === k ? ' on' : '') + '" data-fmode="' + k + '">' + label + '</button>'
+      ).join('') + '</div>';
+  if (fileResults === null) {
+    box.innerHTML = head + '<div class="emptyhint">正在查索引…</div>';
+    loadFiles();
+    return;
+  }
+  if (!fileResults.length) {
+    let hint;
+    if (fileQ) hint = '<div class="emptyhint">没有命中。</div>';
+    else if (!fileStatus) hint = '<div class="emptyhint">正在读索引状态…</div>';
+    else if (!fileStatus.files) {
+      hint = '<div class="emptyhint">还没有索引。先登记工作区：<code>mem files add &lt;目录&gt;</code>，再 <code>mem files index</code>。</div>';
+    } else {
+      hint = '<div class="emptyhint">已索引 ' + fileStatus.files + ' 个文件（有正文 ' +
+        (fileStatus.content_indexed || 0) + ' 个）· 输入关键词开始搜索</div>' +
+        (fileStatus.roots || []).map((r) =>
+          '<div class="mem"><div class="m"><span>' + esc(r) + '</span></div></div>').join('');
+    }
+    box.innerHTML = head + hint;
+    bindFileHead(box);
+    return;
+  }
+  box.innerHTML = head + fileResults.map((f, i) =>
+    '<div class="mem" data-file="' + i + '">' +
+      '<div class="t">' + esc(f.name) + '</div>' +
+      (f.snippet ? '<div class="pf">' + esc(String(f.snippet).slice(0, 120)) + '</div>' : '') +
+      '<div class="m"><span>' + esc(f.hit === 'content' ? '正文' : '名字') + '</span>' +
+        '<span>' + esc(String(f.dir || '').slice(-28)) + '</span>' +
+        '<span>' + esc(fmtSize(f.size)) + '</span></div>' +
+      '<div class="fbtn"><button data-fopen="' + i + '">打开目录</button>' +
+        '<button data-freveal="' + i + '">选中文件</button></div>' +
+    '</div>').join('') +
+    '<div class="emptyhint">共 ' + (fileResults._total || fileResults.length) + ' 条</div>';
+  bindFileHead(box);
+  const q = box.querySelector('#fq');
+  if (q) {
+    q.oninput = () => {
+      fileQ = q.value.trim();
+      clearTimeout(fileTimer);
+      fileTimer = setTimeout(() => loadFiles(false), 260);
+    };
+    if (!fileQ) q.focus();
+  }
+  Array.from(box.querySelectorAll('[data-fmode]')).forEach((b) => {
+    b.onclick = () => { fileMode = b.dataset.fmode; loadFiles(true); };
+  });
+  Array.from(box.querySelectorAll('[data-fopen],[data-freveal]')).forEach((b) => {
+    b.onclick = async (ev) => {
+      ev.stopPropagation();
+      const f = fileResults[Number(b.dataset.fopen ?? b.dataset.freveal)];
+      if (!f) return;
+      const reveal = b.dataset.freveal !== undefined;
+      try {
+        const r = await fetch((reveal ? '/api/reveal?path=' : '/api/open?path=') + encodeURIComponent(f.path));
+        const j = await r.json();
+        if (!j.ok) toast('打不开：' + (j.error || '未知原因'), true);
+      } catch (e) { toast('打开失败', true); }
+    };
+  });
+}
+
+function bindFileHead(box) {
+  const q = box.querySelector('#fq');
+  if (!q) return;
+  q.oninput = () => {
+    fileQ = q.value.trim();
+    clearTimeout(fileTimer);
+    fileTimer = setTimeout(() => loadFiles(false), 260);
+  };
+}
+
 /* ---------------- 雷区：动手前该知道的坑 ---------------- */
 let pitList = null, pitPending = false;
 
@@ -2006,6 +2125,7 @@ function renderList() {
   const box = $('#list');
   if (tab === 'sleep') { renderSleepList(box); return; }
   if (tab === 'pit') { renderPitList(box); return; }
+  if (tab === 'file') { renderFileList(box); return; }
   const all = memNodes.filter((m) => m.id !== '__me__');
   let items;
   if (tab === 'std') items = all.filter((m) => m.kind === 'preference' || m.kind === 'identity');
@@ -2038,6 +2158,7 @@ function bindUI() {
       b.classList.add('on'); tab = b.dataset.tab;
       if (tab === 'sleep') sleeperList = null;    // 沉睡区每次进入都重新取
       if (tab === 'pit') pitList = null;          // 雷区同理：随时可能新增
+      if (tab === 'file') fileResults = null;     // 文件：重新查一次
       renderList();
     };
   });

@@ -51,6 +51,15 @@ def parse_when(v):
     raise SystemExit("bad date: %s (use YYYY-MM-DD or epoch)" % v)
 
 
+def fmt_bytes_local(n) -> str:
+    n = int(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "%d B" % n
+
+
 def out(s: str = "") -> None:
     sys.stdout.write(s + "\n")
 
@@ -188,6 +197,16 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("unsleep", parents=[common], help="撤销人工沉睡，交还给时间与权重")
     p.add_argument("id")
+
+    p = sub.add_parser("files", parents=[common], help="本机文件索引：登记目录 / 建索引 / 搜文件 / 打开")
+    p.add_argument("action", choices=["add", "rm", "list", "index", "search", "status", "open"])
+    p.add_argument("value", nargs="?", default="", help="目录路径（add/rm/open）或关键词（search）")
+    p.add_argument("--mode", default="all", choices=["all", "name", "content"])
+    p.add_argument("--ext", default="")
+    p.add_argument("-n", "--limit", type=int, default=20)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--full", action="store_true", help="index 时做全量重扫（默认增量）")
+    p.add_argument("--reveal", action="store_true", help="open 时在文件管理器中选中该文件")
 
     p = sub.add_parser("preflight", parents=[common],
                        help="动手前查一次：这些文件/这个主题以前踩过什么坑")
@@ -444,6 +463,74 @@ def main(argv=None) -> int:
             else:
                 out("%s \u2192 %s（激活度 %.2f）" % (args.id, st["state_label"], st["activation"]))
             return 0
+
+        if args.cmd == "files":
+            act = args.action
+            if act in ("add", "rm"):
+                if not args.value:
+                    out("用法：mem files %s <目录>" % act)
+                    return 2
+                r = m.add_file_root(args.value) if act == "add" else m.remove_file_root(args.value)
+                if args.json:
+                    dump(r)
+                else:
+                    out(("已登记：" if act == "add" else "已移除：") + args.value if r.get("ok") else r.get("error", "失败"))
+                    for x in (r.get("roots") or []):
+                        out("  - " + x)
+                return 0 if r.get("ok") else 1
+            if act == "list":
+                roots = m.file_roots()
+                if args.json:
+                    dump({"roots": roots})
+                else:
+                    out("\n".join(roots) if roots else "(还没有登记目录：mem files add <dir>)")
+                return 0
+            if act == "index":
+                r = m.index_files(incremental=not args.full)
+                if args.json:
+                    dump(r)
+                else:
+                    if not r.get("ok"):
+                        out(r.get("error", "索引失败")); return 1
+                    out("索引完成：更新 %d · 跳过 %d · 清理 %d · 共 %d 个文件"
+                        % (r["updated"], r["skipped"], r["removed"], r["files"]))
+                return 0
+            if act == "status":
+                st = m.file_status()
+                if args.json:
+                    dump(st)
+                else:
+                    out("目录 %d 个 · 文件 %d 个 · 有正文 %d 个" % (len(st["roots"]), st["files"], st["content_indexed"]))
+                    for x in st["roots"]:
+                        out("  - " + x)
+                    li = st.get("last_index") or {}
+                    if li:
+                        out("上次索引：%s · 更新 %d · 跳过 %d" % (
+                            time.strftime("%Y-%m-%d %H:%M", time.localtime(int(li.get("at", 0)))),
+                            li.get("updated", 0), li.get("skipped", 0)))
+                return 0
+            if act == "search":
+                r = m.file_search(args.value, mode=args.mode, limit=args.limit,
+                                  offset=args.offset, ext=args.ext)
+                if args.json:
+                    dump(r)
+                else:
+                    if not r["results"]:
+                        out("(没有命中；先 mem files index 建索引，或 mem files add <dir> 登记目录)")
+                    for x in r["results"]:
+                        out("%s %-40s %s%s" % ("[正文]" if x["hit"] == "content" else "[名字]",
+                                               x["path"], fmt_bytes_local(x["size"]),
+                                               ("\n      " + x["snippet"][:120]) if x.get("snippet") else ""))
+                    out("共 %d 条" % r["total"])
+                return 0
+            if act == "open":
+                r = m.open_path(args.value, reveal=args.reveal)
+                if args.json:
+                    dump(r)
+                else:
+                    out(("已在文件管理器中打开：" if r.get("ok") else r.get("error", "打开失败")) + (r.get("opened") or ""))
+                return 0 if r.get("ok") else 1
+            return 2
 
         if args.cmd == "preflight":
             r = m.preflight(args.paths, topic=args.topic, limit=args.limit,

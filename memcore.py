@@ -100,6 +100,19 @@ DEFAULT_CONFIG = {
     },
     # 检索空结果时是否回落（只在"该有答案"的通道上开：recall 开，preflight 永不开）
     "recall": {"fallback": True, "fallback_n": 6},
+    # 本机文件索引（借 arcdream-hub 的工作区登记 + 增量索引；检索复用 memcore 自己的 FTS5）
+    "files": {
+        "roots": [],
+        "max_content_bytes": 262144,
+        "max_files": 200000,
+        "skip_dirs": ["node_modules", ".git", ".svn", ".hg", "__pycache__", ".venv", "venv",
+                      "dist", "build", "out", "target", ".next", ".cache", "vendor", ".tox"],
+        "index_exts": [".md", ".txt", ".json", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+                       ".py", ".html", ".htm", ".css", ".yml", ".yaml", ".toml", ".ini",
+                       ".cfg", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".sql", ".csv", ".log",
+                       ".rs", ".go", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".rb",
+                       ".php", ".swift", ".lua", ".r", ".patch", ".diff"],
+    },
     "mmr_lambda": 0.72,
     "dedupe_exact": True,
     "dedupe_fuzzy": 0.965,
@@ -449,6 +462,15 @@ CREATE TABLE IF NOT EXISTS links (src TEXT NOT NULL, dst TEXT NOT NULL, rel TEXT
 CREATE TABLE IF NOT EXISTS vectors (memory_id TEXT PRIMARY KEY, v BLOB NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(memory_id UNINDEXED, text, tokenize='trigram');
 CREATE TABLE IF NOT EXISTS access_log (id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT, ts INTEGER, q TEXT);
+-- 本机文件索引：元数据 + 正文（文本类、≤256KB）。增量靠 (size,mtime) 三元组比对。
+CREATE TABLE IF NOT EXISTS files (
+  path TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', dir TEXT NOT NULL DEFAULT '',
+  ext TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL DEFAULT 0,
+  root TEXT NOT NULL DEFAULT '', project TEXT NOT NULL DEFAULT '', indexed_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+CREATE INDEX IF NOT EXISTS idx_files_root ON files(root);
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(path UNINDEXED, name, content, tokenize='trigram');
 """
 
 
@@ -1421,6 +1443,253 @@ class Memory:
             })
         rows.sort(key=lambda x: (x["activation"], x["created_at"]))
         return rows[: max(1, int(limit))]
+
+    # -- 本机文件索引 -------------------------------------------------------
+    def _file_cfg(self) -> Dict[str, Any]:
+        f = self.cfg.get("files")
+        return f if isinstance(f, dict) else {}
+
+    def file_roots(self) -> List[str]:
+        out: List[str] = []
+        for r in (self._file_cfg().get("roots") or []):
+            try:
+                p = os.path.realpath(os.path.expanduser(str(r)))
+            except OSError:
+                continue
+            if os.path.isdir(p) and p not in out:
+                out.append(p)
+        return out
+
+    def add_file_root(self, path: str) -> Dict[str, Any]:
+        p = os.path.realpath(os.path.expanduser(str(path or "")))
+        if not os.path.isdir(p):
+            return {"ok": False, "error": "不是目录：%s" % path}
+        roots = [r for r in (self._file_cfg().get("roots") or []) if r != p]
+        roots.append(p)
+        self.save_settings({"files": {"roots": roots}})
+        return {"ok": True, "roots": self.file_roots()}
+
+    def remove_file_root(self, path: str) -> Dict[str, Any]:
+        p = os.path.realpath(os.path.expanduser(str(path or "")))
+        roots = [r for r in (self._file_cfg().get("roots") or [])
+                 if os.path.realpath(os.path.expanduser(r)) != p]
+        self.save_settings({"files": {"roots": roots}})
+        return {"ok": True, "roots": self.file_roots()}
+
+    def within_roots(self, path: str, roots: Optional[Sequence[str]] = None) -> bool:
+        """路径归属判定：用 relpath + realpath，绝不用 startswith。
+
+        `/work` 前缀能放行 `/work-evil/x` 是 arcdream-hub v0.1.2 踩过的真坑；
+        realpath 再挡一层符号链接逃逸。
+        """
+        rs = list(roots) if roots is not None else self.file_roots()
+        if not rs:
+            return False
+        try:
+            abs_p = os.path.realpath(os.path.expanduser(str(path or "")))
+        except OSError:
+            return False
+        for r in rs:
+            try:
+                rr = os.path.realpath(os.path.expanduser(str(r)))
+            except OSError:
+                continue
+            try:
+                rel = os.path.relpath(abs_p, rr)
+            except ValueError:
+                continue
+            if rel == "." or (not rel.startswith(os.pardir + os.sep) and rel != os.pardir
+                              and not os.path.isabs(rel)):
+                return True
+        return False
+
+    def _walk_files(self, root: str, skip: set, limit: int):
+        n = 0
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames
+                           if d.lower() not in skip and not d.startswith(".")]
+            for fn in filenames:
+                if n >= limit:
+                    return
+                n += 1
+                yield os.path.join(dirpath, fn)
+
+    def index_files(self, roots: Optional[Sequence[str]] = None, incremental: bool = True,
+                    max_files: Optional[int] = None) -> Dict[str, Any]:
+        """扫描登记的工作区，建/更新文件索引。返回本轮计数（含"跳过了多少"）。"""
+        cfg = self._file_cfg()
+        rs = [os.path.realpath(os.path.expanduser(r)) for r in (roots or self.file_roots())]
+        rs = [r for r in rs if os.path.isdir(r)]
+        if not rs:
+            return {"ok": False, "error": "没有可索引的目录（先 mem files add <dir>）"}
+        exts = {e.lower() for e in (cfg.get("index_exts") or [])}
+        skip = {x.lower() for x in (cfg.get("skip_dirs") or [])}
+        max_bytes = int(cfg.get("max_content_bytes", 262144))
+        limit = int(max_files or cfg.get("max_files", 200000))
+        t = now()
+        prev = {r["path"]: (int(r["size"]), int(r["mtime"]))
+                for r in self.db.execute("SELECT path,size,mtime FROM files")} if incremental else {}
+        seen: set = set()
+        rows, fts_rows = [], []
+        updated = skipped = 0
+        for root in rs:
+            for full in self._walk_files(root, skip, limit):
+                seen.add(full)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                size, mtime = int(st.st_size), int(st.st_mtime)
+                if incremental and prev.get(full) == (size, mtime):
+                    skipped += 1
+                    continue
+                name = os.path.basename(full)
+                ext = os.path.splitext(name)[1].lower()
+                try:
+                    rel = os.path.relpath(full, root)
+                except ValueError:
+                    rel = name
+                project = rel.split(os.sep)[0] if os.sep in rel else ""
+                rows.append((full, name, os.path.dirname(full), ext, size, mtime, root, project, t))
+                text = None
+                if ext in exts and size <= max_bytes:
+                    try:
+                        with open(full, "r", encoding="utf-8", errors="ignore") as fh:
+                            text = fh.read(max_bytes)
+                    except OSError:
+                        text = None
+                fts_rows.append((full, name, text if text is not None else ""))
+                updated += 1
+        removed = [p for p in prev if p not in seen] if incremental else []
+        with self.db:
+            for chunk in _chunks(rows, 400):
+                self.db.executemany(
+                    "INSERT OR REPLACE INTO files(path,name,dir,ext,size,mtime,root,project,indexed_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)", chunk)
+            for chunk in _chunks(fts_rows, 400):
+                self.db.executemany("DELETE FROM files_fts WHERE path=?", [(r[0],) for r in chunk])
+                self.db.executemany("INSERT INTO files_fts(path,name,content) VALUES(?,?,?)", chunk)
+            for pth in removed:
+                self.db.execute("DELETE FROM files WHERE path=?", (pth,))
+                self.db.execute("DELETE FROM files_fts WHERE path=?", (pth,))
+        self.cfg.setdefault("files", {})["last_index"] = {"at": t, "updated": updated,
+                                                          "skipped": skipped, "removed": len(removed)}
+        self._journal("index_files", "-", {"updated": updated, "skipped": skipped,
+                                           "removed": len(removed), "roots": len(rs)})
+        return {"ok": True, "roots": rs, "updated": updated, "skipped": skipped,
+                "removed": len(removed), "files": self.file_status()["files"]}
+
+    def file_status(self) -> Dict[str, Any]:
+        total = self.db.execute("SELECT count(*) c FROM files").fetchone()["c"]
+        withc = 0
+        try:
+            withc = self.db.execute(
+                "SELECT count(*) c FROM files_fts WHERE length(content)>0").fetchone()["c"]
+        except sqlite3.OperationalError:
+            withc = 0
+        last = (self._file_cfg().get("last_index") or {})
+        return {"ok": True, "roots": self.file_roots(), "files": int(total),
+                "content_indexed": int(withc), "last_index": last,
+                "exts": len(self._file_cfg().get("index_exts") or [])}
+
+    def file_search(self, q: str, mode: str = "all", limit: int = 20, offset: int = 0,
+                    ext: str = "") -> Dict[str, Any]:
+        """搜本机文件：mode=name|content|all。正文片段是纯文本（高亮留给前端）。"""
+        q = (q or "").strip()
+        if not q:
+            return {"ok": True, "total": 0, "results": [], "mode": mode}
+        mode = mode if mode in ("name", "content", "all") else "all"
+        ext = (ext or "").lower()
+        if ext and not ext.startswith("."):
+            ext = "." + ext
+        exts_sql = ""
+        exts_params: List[Any] = []
+        if ext:
+            exts_sql = " AND f.ext=?"
+            exts_params = [ext]
+        lim = max(1, min(200, int(limit or 20)))
+        off = max(0, int(offset or 0))
+        rows: List[Dict[str, Any]] = []
+        total = 0
+        seen: set = set()
+
+        def add(rs, hit):
+            nonlocal total
+            for r in rs:
+                if r["path"] in seen:
+                    continue
+                seen.add(r["path"])
+                item = dict(r)
+                item["hit"] = hit
+                rows.append(item)
+
+        if mode in ("name", "all"):
+            like = "%" + q.replace("%", "").replace("_", "") + "%"
+            base = ("SELECT f.path,f.name,f.dir,f.ext,f.size,f.mtime,f.project, '' AS snippet"
+                    " FROM files f WHERE (f.name LIKE ? OR f.path LIKE ?)" + exts_sql +
+                    " ORDER BY CASE WHEN f.name LIKE ? THEN 0 ELSE 1 END, f.mtime DESC")
+            cnt = self.db.execute(
+                "SELECT count(*) c FROM files f WHERE (f.name LIKE ? OR f.path LIKE ?)" + exts_sql,
+                [like, like] + exts_params).fetchone()["c"]
+            total += int(cnt)
+            add(self.db.execute(base + " LIMIT ? OFFSET ?",
+                                [like, like, like] + exts_params + [lim, off]).fetchall(), "name")
+
+        if mode in ("content", "all"):
+            try:
+                if len(q) < 3:
+                    raise sqlite3.OperationalError("trigram 至少要 3 个码点，短词只搜文件名")
+                # 限定只搜 content 列：否则名字命中会重复计入 total（rows 侧去重了，total 没去）
+                match = 'content : "' + q.replace('"', '""') + '"'
+                sql = ("SELECT f.path,f.name,f.dir,f.ext,f.size,f.mtime,f.project,"
+                       " snippet(files_fts, 2, '', '', '…', 32) AS snippet"
+                       " FROM files_fts JOIN files f ON f.path=files_fts.path"
+                       " WHERE files_fts MATCH ?" + exts_sql +
+                       " ORDER BY bm25(files_fts) LIMIT ? OFFSET ?")
+                cnt = self.db.execute(
+                    "SELECT count(*) c FROM files_fts JOIN files f ON f.path=files_fts.path"
+                    " WHERE files_fts MATCH ?" + exts_sql, [match] + exts_params).fetchone()["c"]
+                total += int(cnt)
+                add(self.db.execute(sql, [match] + exts_params + [lim, off]).fetchall(), "content")
+            except sqlite3.OperationalError:
+                pass
+        rows = rows[:lim]
+        return {"ok": True, "total": total, "results": [dict(r) for r in rows], "mode": mode}
+
+    def file_read(self, path: str, max_bytes: Optional[int] = None) -> Dict[str, Any]:
+        """读登记工作区内的文本文件（默认 ≤256KB）。越界直接拒绝。"""
+        if not self.within_roots(path):
+            return {"ok": False, "error": "路径不在已登记的工作区内", "code": 403}
+        p = os.path.realpath(os.path.expanduser(path))
+        if not os.path.isfile(p):
+            return {"ok": False, "error": "文件不存在", "code": 404}
+        cap = int(max_bytes or self._file_cfg().get("max_content_bytes", 262144))
+        if os.path.getsize(p) > cap:
+            return {"ok": False, "error": "文件太大（>%d 字节）" % cap, "code": 413}
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                return {"ok": True, "path": p, "text": fh.read(cap)}
+        except OSError as e:
+            return {"ok": False, "error": str(e), "code": 500}
+
+    def open_path(self, path: str, reveal: bool = False) -> Dict[str, Any]:
+        """用系统文件管理器打开目录/选中文件。只接受登记根内路径。"""
+        if not self.within_roots(path):
+            return {"ok": False, "error": "路径不在已登记的工作区内", "code": 403}
+        p = os.path.realpath(os.path.expanduser(path))
+        if not os.path.exists(p):
+            return {"ok": False, "error": "路径不存在", "code": 404}
+        if sys.platform == "darwin":
+            cmd = ["open", "-R", p] if (reveal and os.path.isfile(p)) else ["open", p]
+        elif os.name == "nt":
+            cmd = ["explorer", ("/select,%s" % p) if (reveal and os.path.isfile(p)) else p]
+        else:
+            cmd = ["xdg-open", p]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            return {"ok": False, "error": str(e), "code": 500}
+        return {"ok": True, "opened": p, "reveal": bool(reveal)}
 
     # -- preflight: 动手前的雷区清单 ---------------------------------------
     @staticmethod

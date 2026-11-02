@@ -483,6 +483,72 @@ class TestRetrievalErgonomics(Base):
         self.assertNotIn("回落", r["text"])
 
 
+class TestFileIndex(Base):
+    """本机文件索引（借 arcdream-hub 的工作区登记）：名字/正文/增量/删除/越界。"""
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.home, "ws")
+        os.makedirs(os.path.join(self.root, "proj", "docs"), exist_ok=True)
+        os.makedirs(os.path.join(self.root, "proj", "node_modules"), exist_ok=True)
+        with open(os.path.join(self.root, "proj", "docs", "notes.md"), "w", encoding="utf-8") as fh:
+            fh.write("# 笔记\n正文关键词 ZEBRAWORD 在中间。\n")
+        with open(os.path.join(self.root, "proj", "app.js"), "w", encoding="utf-8") as fh:
+            fh.write('console.log("hi")\n')
+        with open(os.path.join(self.root, "proj", "node_modules", "skip.js"), "w", encoding="utf-8") as fh:
+            fh.write("skip me\n")
+        with open(os.path.join(self.home, "outside.txt"), "w", encoding="utf-8") as fh:
+            fh.write("outside\n")
+        self.m.add_file_root(self.root)
+
+    def test_index_skips_noise_dirs(self):
+        r = self.m.index_files()
+        self.assertTrue(r["ok"])
+        names = {x["name"] for x in self.m.db.execute("SELECT name FROM files")}
+        self.assertIn("notes.md", names)
+        self.assertIn("app.js", names)
+        self.assertNotIn("skip.js", names)          # node_modules 不索引
+        self.assertEqual(self.m.file_status()["content_indexed"], 2)
+
+    def test_name_and_content_search(self):
+        self.m.index_files()
+        self.assertEqual(self.m.file_search("notes", mode="name")["total"], 1)
+        r = self.m.file_search("ZEBRAWORD", mode="content")
+        self.assertEqual(r["total"], 1)
+        self.assertEqual(r["results"][0]["hit"], "content")
+        self.assertIn("ZEBRAWORD", r["results"][0]["snippet"])
+        self.assertNotIn("<mark>", r["results"][0]["snippet"])   # 片段是纯文本，高亮交给前端
+
+    def test_incremental_skips_unchanged_and_removes_deleted(self):
+        self.m.index_files()
+        self.assertEqual(self.m.index_files()["skipped"], 2)
+        os.remove(os.path.join(self.root, "proj", "app.js"))
+        r = self.m.index_files()
+        self.assertEqual(r["removed"], 1)
+        self.assertEqual(self.m.file_search("app.js", mode="name")["total"], 0)
+
+    def test_path_containment(self):
+        """归属判定用 relpath+realpath：/work 不能放行 /work-evil，也不能被 .. 逃逸。"""
+        evil = self.root + "-evil"
+        os.makedirs(evil, exist_ok=True)
+        with open(os.path.join(evil, "x.txt"), "w", encoding="utf-8") as fh:
+            fh.write("evil\n")
+        self.assertFalse(self.m.within_roots(os.path.join(evil, "x.txt")))
+        self.assertFalse(self.m.within_roots(os.path.join(self.home, "outside.txt")))
+        self.assertTrue(self.m.within_roots(os.path.join(self.root, "proj", "docs", "notes.md")))
+        self.assertEqual(self.m.file_read(os.path.join(evil, "x.txt"))["code"], 403)
+        self.assertEqual(self.m.open_path(os.path.join(evil, "x.txt"))["code"], 403)
+
+    def test_file_read_limits(self):
+        self.m.index_files()
+        ok = self.m.file_read(os.path.join(self.root, "proj", "docs", "notes.md"))
+        self.assertTrue(ok["ok"])
+        big = os.path.join(self.root, "big.txt")
+        with open(big, "w", encoding="utf-8") as fh:
+            fh.write("x" * 2048)
+        self.assertEqual(self.m.file_read(big, max_bytes=1024)["code"], 413)
+
+
 class TestPreflight(Base):
     """动手前查雷区：坑按文件名归档，preflight 必须把它捞出来。"""
 

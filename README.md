@@ -312,7 +312,29 @@ $M learn --help                            # 标签自动带 pitfall + 文件名
 - 全局层还有一层保险：`$DSH_HOME/AGENTS.md`（`~/.dsh/AGENTS.md`）由 harness 每个会话注入，
   里面就是这张表 —— 记忆协议不再依赖模型自己想起来。
 
-## 5. 三种调用形态
+## 4.7 本机文件索引（借 arcdream-hub 的工作区登记）
+
+记忆之外，memcore 现在也能把**登记的工作区**索引成可搜的文件库——这两件事终于接上了：
+"我记得这个文件" → 直接搜到、直接打开。
+
+```bash
+mem files add ~/Documents/项目      # 登记一个工作区（可多个）
+mem files index                     # 建索引（默认增量：只读变化的文件）
+mem files search 报表 --mode name    # 按文件名
+mem files search 结算口径 --mode content   # 按正文（返回纯文本片段）
+mem open <路径>                      # 系统文件管理器打开
+```
+
+- 表：`files`（名字/路径/大小/mtime/所属项目）+ `files_fts`（trigram 正文，文本类 ≤256KB）。
+- **增量**：按 `(path,size,mtime)` 三元组比对，未变连正文都不读；删除在整轮结束后清扫。
+- **越界防护**：只认登记根内路径，判定用 `relpath + realpath`（不是 `startsWith`）——
+  `/work` 放行 `/work-evil` 是 arcdream-hub v0.1.2 踩过的真坑。
+- 面板右栏新增 **「文件」页签**：搜名字/正文、片段预览、一键「打开目录 / 选中文件」。
+- HTTP：`/api/files/{status,search,index,roots}`、`/api/file`、`/api/open`、`/api/reveal`。
+
+拆解笔记与"搬什么/不搬什么"：[docs/research/05-arcdream-hub.md](docs/research/05-arcdream-hub.md)。
+
+## 5. 三种调用形态## 5. 三种调用形态
 
 > 装到自己机器上时，`bundle-mcp/cordis.patch.yml` 里的 `args` 路径要改成你的实际安装位置。
 

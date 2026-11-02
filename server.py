@@ -247,7 +247,8 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                 self._json({"error": "cross-origin write refused"}, 403)
                 return
             u = urllib.parse.urlparse(self.path)
-            routes = {"/api/llm/test", "/api/settings", "/api/action"}
+            routes = {"/api/llm/test", "/api/settings", "/api/action",
+                      "/api/files/index", "/api/files/roots"}
             if u.path not in routes:
                 self._json({"error": "not found"}, 404)
                 return
@@ -256,7 +257,15 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                 return
             m = db()
             try:
-                if u.path == "/api/llm/test":
+                if u.path == "/api/files/index":
+                    r = m.index_files(incremental=bool(payload.get("incremental", True)))
+                    self._json(r, 200 if r.get("ok") else 400)
+                elif u.path == "/api/files/roots":
+                    act = str(payload.get("action") or "add")
+                    pth = str(payload.get("path") or "")[:2000]
+                    r = m.add_file_root(pth) if act == "add" else m.remove_file_root(pth)
+                    self._json(r, 200 if r.get("ok") else 400)
+                elif u.path == "/api/llm/test":
                     base = str(payload.get("base") or "")
                     if base and not _safe_base(base):
                         self._json({"ok": False, "error": "base 只支持 https 或本机回环地址", "models": []})
@@ -399,6 +408,27 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                         with lock:
                             cache["models"] = (now, out)
                         self._json(out)
+                elif u.path == "/api/files/search":
+                    q = (qs.get("q", [""])[0] or "")[:300]
+                    mode = (qs.get("mode", ["all"])[0] or "all")
+                    ext = (qs.get("ext", [""])[0] or "")[:12]
+                    limit = _int(qs.get("limit", ["20"])[0], 20, 1, 200)
+                    offset = _int(qs.get("offset", ["0"])[0], 0, 0, 100000)
+                    self._json(m.file_search(q, mode=mode, limit=limit, offset=offset, ext=ext))
+                elif u.path == "/api/files/status":
+                    self._json(m.file_status())
+                elif u.path == "/api/file":
+                    fp = (qs.get("path", [""])[0] or "")[:2000]
+                    r = m.file_read(fp)
+                    self._json(r, 200 if r.get("ok") else int(r.get("code") or 400))
+                elif u.path == "/api/open":
+                    fp = (qs.get("path", [""])[0] or "")[:2000]
+                    r = m.open_path(fp, reveal=False)
+                    self._json(r, 200 if r.get("ok") else int(r.get("code") or 400))
+                elif u.path == "/api/reveal":
+                    fp = (qs.get("path", [""])[0] or "")[:2000]
+                    r = m.open_path(fp, reveal=True)
+                    self._json(r, 200 if r.get("ok") else int(r.get("code") or 400))
                 elif u.path == "/api/pitfalls":
                     limit = _int(qs.get("limit", ["200"])[0], 200, 1, 1000)
                     self._json(m.pitfalls(file=(qs.get("file", [""])[0] or "")[:120], limit=limit))

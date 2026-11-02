@@ -380,5 +380,65 @@ class PitfallApi(unittest.TestCase):
         self.assertEqual(d["items"], [])
 
 
+class FilesApi(unittest.TestCase):
+    """文件索引的 HTTP 出口：搜索、状态、越界拒绝。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="memcore-files-")
+        cls.ws = os.path.join(cls.tmp, "ws")
+        os.makedirs(os.path.join(cls.ws, "docs"), exist_ok=True)
+        with open(os.path.join(cls.ws, "docs", "note.md"), "w", encoding="utf-8") as fh:
+            fh.write("# 笔记\n关键词 ZEBRAWORD 在这里。\n")
+        cls.env = dict(os.environ, MEM_HOME=cls.tmp)
+        subprocess.run([sys.executable, "-c",
+                        "import sys;sys.path.insert(0,%r);from memcore import Memory;"
+                        "m=Memory(%r);m.add_file_root(%r);print(m.index_files()['files']);m.close()"
+                        % (ROOT, cls.tmp, cls.ws)], env=cls.env, check=True, capture_output=True)
+        cls.port = _free_port()
+        cls.proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "mem"), "serve", "--port", str(cls.port)],
+            env=cls.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _wait(cls.port):
+            cls.proc.kill()
+            raise unittest.SkipTest("面板服务未在超时内启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+
+    def get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path, headers={"Host": "127.0.0.1:%d" % self.port})
+        r = conn.getresponse()
+        raw = r.read().decode()
+        conn.close()
+        return r.status, (json.loads(raw) if raw else {})
+
+    def test_status_and_search(self):
+        code, st = self.get("/api/files/status")
+        self.assertEqual(code, 200)
+        self.assertEqual(st["files"], 1)
+        code, r = self.get("/api/files/search?q=ZEBRAWORD&mode=content")
+        self.assertEqual(code, 200)
+        self.assertEqual(r["total"], 1)
+        self.assertEqual(r["results"][0]["hit"], "content")
+
+    def test_file_read_containment(self):
+        code, _ = self.get("/api/file?path=/etc/passwd")
+        self.assertEqual(code, 403)
+        code, r = self.get("/api/file?path=" + os.path.join(self.ws, "docs", "note.md"))
+        self.assertEqual(code, 200)
+        self.assertIn("ZEBRAWORD", r["text"])
+
+    def test_open_rejects_outside(self):
+        code, _ = self.get("/api/open?path=/etc")
+        self.assertEqual(code, 403)
+
+
 if __name__ == "__main__":
     unittest.main()
