@@ -14,6 +14,16 @@
 > budget-packed context, MCP tools, and a zero-dependency WebGL2 "memory nebula" panel.
 > Python 3.9+, stdlib only. `mem serve` → http://127.0.0.1:8790/
 
+**记忆会老**：激活度按"时间 × 重要度 × 唤醒权重"分四档 —— 清醒 / 模糊 / 沉睡 / 深度沉睡。
+
+| 星云面板 | 沉睡区 |
+|---|---|
+| ![记忆状态](docs/nebula-dormancy.jpg) | ![沉睡区](docs/nebula-sleepers.jpg) |
+| **雷区页签**（按文件归档的坑） | |
+| ![雷区](docs/nebula-pitfalls.jpg) | |
+| 经典图谱（状态分布 + 清醒率） | 浅色宿主下的面板 |
+| ![经典页状态](docs/classic-dormancy-real.jpg) | ![浅色宿主](docs/classic-hosted-light.jpg) |
+
 | | |
 |---|---|
 | 双栏收起 | ![收起](docs/nebula-collapsed.png) |
@@ -31,6 +41,7 @@
 ├── tests/test_server.py     面板安全回归（Host/Origin/上限/注入）
 ├── ui/nebula.html           记忆星云（3D 鎏金大脑，零依赖 WebGL2）
 ├── ui/index.html            经典 2D 力导向图谱（/classic）
+├── docs/DORMANCY-CONTRACT.md 记忆模糊/沉睡的数据契约（UI 与引擎的唯一约定）
 ├── SKILL.md                 使用纪律（何时查、怎么写）
 └── tools/sessions_dump.js   解压 dsh 会话归档
 
@@ -169,6 +180,85 @@ $M export          # 重建 MEMORY.md
 $M stats --json
 ```
 
+## 4.5 记忆模糊与沉睡（本轮新增）
+
+记忆不是"存在或不存在"两态。每条记忆都有一个**激活度**（0~1），由时间与重要度共同决定，
+落成四档：
+
+| 状态 | 激活度 | 检索行为 | 面板表现 |
+|---|---|---|---|
+| 清醒 | ≥ 0.45 | 正常召回，正文完整 | 原色 + 正常亮度 |
+| 模糊 | 0.26 ~ 0.45 | 还能召回，但正文**雾化**（首尾保留、中段遮罩，同一记忆每次花纹一致） | 混灰、变暗、外圈雾环 |
+| 沉睡 | 0.15 ~ 0.26 | 只有强线索才召回：**精确命中即当场唤醒** | 明显变暗、缩小 |
+| 深度沉睡 | < 0.15 | 需要更强的线索（标签/实体精确命中或高相似）才可能叫醒 | 几乎隐入背景 |
+
+**激活度怎么算**（`dormancy.weights` 可调）：
+
+```
+激活度 = 0.52·时间衰减 + 0.20·显著度 + 0.12·复用(use_count) + 0.10·唤醒权重
+```
+
+- **时间衰减**按"每类记忆的保质期"（`dormancy.life_days`）算半衰期：
+  会话片段 1.2 天、笔记/待办 10~14 天、产物 10 天、事实 120 天、偏好 720 天、身份 10 年。
+  会话碎片本来就是快消品，一天半就淡；写进库里的偏好十年都亮着。
+- **重要权重**（显著度 + 复用）是加法项，所以重要的记忆有下限：反复用过 25 次以上的条目
+  光靠这一项就 ≥ 0.12，再淡也不会彻底消失。`pinned` 直接把下限抬到 0.80 —— 钉子永不下沉。
+- **唤醒权重**：每次被叫醒，`wake_count` +1，之后按 **72 小时半衰期**衰减。
+  唤醒次数越多底子越厚（`0.8 + 0.07×(次数-1)`）。唤醒同时刷新"最近被想起"的时间，所以被叫醒的记忆会真的亮一阵。
+- **时间从"最近一次被想起"算**：写入、被召回（`recall`）、主动唤醒，三者取最近。
+
+**触发词（暗号）**：写入时可以用 `--trigger "直播,推流"` 给一条记忆挂钥匙 —— 查询里出现任一触发词，
+触发强度直接顶到 1.0，睡得多深都会被叫醒。
+
+**特定触发唤醒**：`search/recall` 命中沉睡条目时，按**绝对**线索强度决定叫不叫醒 ——
+查询串精确出现在标题（0.80）/正文（0.55）、三元组重合度、语义余弦、标签或实体精确命中（+0.20）。
+沉睡档要 ≥ 0.30、深度沉睡要 ≥ 0.55。叫醒有 **10 分钟冷却**，一次灵感不会把同一条记忆连点唤醒十次。
+（刻意不用批量归一化后的 BM25：短查询只有一条结果时它恒等于 1.0，等于一问就全库起床。）
+
+```bash
+$M states                        # 状态分布 + 沉睡区清单（按激活度升序）
+$M states --state deep -n 10
+$M wake M00042                   # 叫醒：唤醒权重 +1，激活度抬回清醒
+$M add -k fact -b "..." --trigger "部署,上线"   # 挂触发词：查询里出现就唤醒
+$M sleep M00042                  # 让它沉睡（内容不删，强线索仍可唤回）
+$M unsleep M00042                # 撤销人工干预，交还给时间
+$M get M00042                    # 顺带显示状态；翻看沉睡条目会自动点亮它
+$M search "推流参数" --json       # 每条结果带 state / state_label / activation / woke
+```
+
+面板侧：左栏"状态"分组 chips 可四档过滤，右栏多一个 `沉睡` tab（`GET /api/sleepers`），
+节点按状态变暗/缩小/加雾环，详情面板可一键 `唤醒 / 沉睡 / 恢复`（`POST /api/action`）。
+数据契约见 [docs/DORMANCY-CONTRACT.md](docs/DORMANCY-CONTRACT.md)。
+
+配置都在 `config.json` 的 `dormancy` 段（阈值、权重、保质期、冷却、雾化比例），改完重启面板生效。
+
+## 4.6 记忆怎么才能真正帮上忙（闭环）
+
+记忆库最大的失败模式不是"存不下"，是**存了但没被想起来**。所以本仓库把检索钉在四个必然发生的时点上：
+
+| 时点 | 命令 | 为什么是这里 |
+|---|---|---|
+| 会话开场 | `mem brief` | 开场不看，后面全靠临时回忆 |
+| 动已有代码前 | `mem preflight <文件...>` | 坑是按文件名归档的，改到一个文件就该把它的雷区摊开 |
+| 测试失败时 | `./tools/mem-guard.sh` | 失败是必然事件，比"自觉"可靠；失败即打雷区 |
+| 修完 / 判断错了 | `mem learn --file <文件> -t 一句话 --what 现象 --fix 修法` | 只写流水不算沉淀，写成"现象+修法"才能被下次检索命中 |
+
+```bash
+$M preflight memcore.py ui/nebula.html     # 这次要动的文件，以前踩过什么
+$M learn --file memcore.py -t "查询列集不一致导致两套分布" \
+   --what "state_counts 少取 last_used_at，/api/stats 与 /api/graph 打架" \
+   --fix "统一走 LIFE_COLS 常量，并加 state_counts == graph_export 的回归用例"
+$M learn --help                            # 标签自动带 pitfall + 文件名
+```
+
+- 坑用 `kind=insight` + `tags=pitfall,<文件名>` 存，`preflight` **先按文件名精确命中**，再语义兜底；
+  非坑的背景条目每次最多带 3 条，避免"一次检查十篇背景资料"。
+- `mem brief` 末尾会带一行「已知雷区 N 条」，开场就能看到该不该 preflight。
+- 面板右栏有 **「雷区」页签**（`GET /api/pitfalls`）：按文件分组，每条显示 ⚠ 标题 + 修法一行，点进去就是那条记忆本身；
+  左栏"记忆体征"旁的雷区计数来自节点 `tags` 里的 `pitfall`，静态导出页也认。
+- 全局层还有一层保险：`$DSH_HOME/AGENTS.md`（`~/.dsh/AGENTS.md`）由 harness 每个会话注入，
+  里面就是这张表 —— 记忆协议不再依赖模型自己想起来。
+
 ## 5. 三种调用形态
 
 > 装到自己机器上时，`bundle-mcp/cordis.patch.yml` 里的 `args` 路径要改成你的实际安装位置。
@@ -179,8 +269,8 @@ $M stats --json
    {"mcpServers": {"memory": {"command": "python3",
      "args": ["~/.dsh/memory-core/mem_mcp.py"]}}}
    ```
-   暴露 `memory_search / memory_recall / memory_brief / memory_add / memory_get / memory_stats`。
-3. **MCP 原生工具**（已装进 desktop profile）：`mcp__memory__memory_search / _recall / _brief / _add / _get / _stats`，
+   暴露 `memory_search / memory_recall / memory_brief / memory_add / memory_get / memory_stats / memory_states / memory_wake`。
+3. **MCP 原生工具**（已装进 desktop profile）：`mcp__memory__memory_search / _recall / _brief / _add / _get / _stats / _states / _wake`，
    bundle 包在 `~/.dsh/memory-core/bundle-mcp`，由 `@deepseek-ai/dsh-mcp-client` 以 stdio 拉起 `mem_mcp.py`，进程常驻。
 4. **常驻协议**：`~/.dsh/prompt-inject.md` 末尾已注入 MEMORY PROTOCOL，
    让"遇到历史问题先查记忆、完成工作立刻沉淀"成为默认行为，不依赖我临时想起。

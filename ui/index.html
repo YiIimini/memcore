@@ -54,7 +54,7 @@ canvas.grabbing{cursor:grabbing}
 #q:focus-visible{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 35%,transparent)}
 .hint{font-size:12px;line-height:16px;color:var(--muted)}
 .section-title{font-size:12px;line-height:16px;color:var(--muted);letter-spacing:.04em;margin:0}
-#kinds{display:flex;flex-wrap:wrap;gap:8px}
+#kinds,#states{display:flex;flex-wrap:wrap;gap:8px}
 .chip{flex:0 0 auto;display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border-radius:999px;
   border:1px solid var(--line);background:transparent;color:var(--muted);cursor:pointer;
   font-size:12px;line-height:16px;transition:color var(--dur-fast) var(--ease),
@@ -63,6 +63,19 @@ canvas.grabbing{cursor:grabbing}
 .chip .sw{width:8px;height:8px;border-radius:50%}
 .chip.on{color:var(--fg);background:var(--surface-2);border-color:var(--line-2)}
 .chip.off{opacity:.45}
+
+/* 雷区提示：静态页只显示计数，不提供写入 */
+.pits{margin-top:6px;font-size:11px;color:var(--muted)}
+.pits b{color:#b45309}
+/* 状态徽标 + 清醒率进度条（前景一律用 --fg，色相只落在圆点上） */
+.sb{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:999px;
+  border:1px solid var(--line);background:var(--surface-2);color:var(--fg);
+  font-size:12px;line-height:16px;font-weight:500;vertical-align:middle;white-space:nowrap}
+.sb .sb-d{width:6px;height:6px;border-radius:50%;flex:none}
+.rate{display:flex;align-items:center;gap:8px;margin-top:4px}
+.rate .bar{flex:1;height:4px;border-radius:999px;background:var(--surface-2);overflow:hidden}
+.rate .bar i{display:block;height:100%;border-radius:999px;
+  background:linear-gradient(90deg,var(--accent),#22d3ee)}
 select{width:100%;padding:8px 12px;border-radius:var(--r-sm);border:1px solid var(--line);
   background:rgba(255,255,255,.05);color:var(--fg);font-size:14px;line-height:20px;outline:none}
 .row{display:flex;gap:8px}
@@ -80,6 +93,10 @@ button{font-family:inherit}
 .btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
 #meta{margin-top:auto;font-size:12px;line-height:16px;color:var(--muted)}
 #meta b{color:var(--fg);font-weight:500}
+#meta .dist{display:flex;flex-wrap:wrap;gap:2px 8px;margin:2px 0}
+#meta .dist span{display:inline-flex;align-items:center;gap:4px}
+#meta .dist .sw{width:6px;height:6px;border-radius:50%;flex:none}
+#meta .rate{white-space:nowrap}
 
 /* detail panel */
 #panel{position:fixed;top:12px;right:12px;bottom:12px;width:384px;z-index:6;
@@ -110,6 +127,11 @@ button{font-family:inherit}
 .acts button:hover{background:var(--surface-2);border-color:var(--line-2)}
 .acts button:active{transform:scale(.98)}
 .acts button.danger:hover{border-color:color-mix(in srgb,var(--danger) 55%,transparent);color:var(--danger)}
+/* 静态页不可写入：淡化填充 + 保留可读前景色，不用整体 opacity 连字一起淡 */
+.acts button:disabled,.acts button:disabled:hover,.acts button:disabled:focus-visible{
+  background:color-mix(in srgb,var(--fg) 5%,transparent);
+  border-color:var(--line);color:var(--muted);
+  cursor:not-allowed;transform:none;box-shadow:none}
 .links .lk{display:flex;gap:8px;align-items:baseline;padding:8px 0;border-bottom:1px solid var(--line);cursor:pointer;
   transition:color var(--dur-fast) var(--ease)}
 .links .lk:last-child{border-bottom:0}
@@ -198,13 +220,15 @@ body.embed #gearfab svg{width:16px;height:16px}
   #phead{padding-top:56px}
 }
 @media (prefers-color-scheme: light){
-  body:not(.embed){
+  body:not(.embed):not(.hosted){
     --fg:#18181B; --muted:rgba(24,24,27,.6);
     --surface:rgba(0,0,0,.04); --surface-2:rgba(0,0,0,.08);
     --line:rgba(0,0,0,.12); --line-2:rgba(0,0,0,.2);
     background:#F6F6F7;
   }
-  body:not(.embed) #rail,body:not(.embed) #panel,body:not(.embed) .card{background:rgba(255,255,255,.72)}
+  body:not(.embed):not(.hosted) #rail,
+  body:not(.embed):not(.hosted) #panel,
+  body:not(.embed):not(.hosted) .card{background:rgba(255,255,255,.72)}
 }
 @media (prefers-reduced-motion: reduce){
   *{transition-duration:1ms !important;animation-duration:1ms !important}
@@ -227,6 +251,9 @@ body.embed #gearfab svg{width:16px;height:16px}
 
   <div class="section-title">类型</div>
   <div id="kinds"></div>
+
+  <div class="section-title">状态</div>
+  <div id="states"></div>
 
   <div class="section-title">项目</div>
   <select id="proj"><option value="">全部项目</option></select>
@@ -318,6 +345,17 @@ const KIND_COLOR = {
   todo:'#ef4444', note:'#64748b'
 };
 const CORE_ID = '__me__';
+
+/* ---------------- 记忆模糊 / 沉睡：视觉调制 ----------------
+   契约 docs/DORMANCY-CONTRACT.md：状态只叠加「透明度 / 灰化 / 半径 / 线型」，
+   按 kind 的配色逻辑（KIND_COLOR）保持不动。 */
+const STATE_ORDER = ['awake', 'fuzzy', 'dormant', 'deep'];
+const STATE_META = {
+  awake:   {label:'清醒',     tint:'#9FB4D8', mix:0,    alpha:1,    ring:0.55, rMul:1,    dash:null},
+  fuzzy:   {label:'模糊',     tint:'#9FB4D8', mix:0.45, alpha:0.55, ring:0.78, rMul:1,    dash:[4,4]},
+  dormant: {label:'沉睡',     tint:'#6E7F9E', mix:0.70, alpha:0.34, ring:0.80, rMul:0.75, dash:[2,6]},
+  deep:    {label:'深度沉睡', tint:'#4A5872', mix:0.85, alpha:0.20, ring:0.72, rMul:0.60, dash:[1,8]}
+};
 const REL_STYLE = {
   core:{color:'#8b9dff', dash:[], w:1},
   related:{color:'#3b82f6', dash:[], w:1},
@@ -331,6 +369,7 @@ let DATA = {nodes:[], edges:[], meta:{}};
 let nodes = [], edges = [], byId = new Map();
 let hidden = new Set();
 let activeKinds = new Set(Object.keys(KIND_COLOR));
+let activeStates = new Set(STATE_ORDER.slice());
 let project = '';
 let showLabels = true;
 let showRetired = false;
@@ -347,6 +386,51 @@ let fitPending = true;
 let simAlpha = 1;
 
 /* ---------------- data ---------------- */
+/* 老 JSON 没有沉睡字段时统一兜底为「清醒 / 激活度 1」，页面不许白屏 */
+function normNode(n){
+  const key = STATE_META[n.state] ? n.state : 'awake';
+  const act = Number(n.activation);
+  const wc = Number(n.wake_count);
+  return Object.assign({}, n, {
+    state: key,
+    state_label: n.state_label || STATE_META[key].label,
+    activation: isFinite(act) ? act : 1,
+    wake_count: isFinite(wc) ? wc : 0,
+    last_wake_at: Number(n.last_wake_at) || 0
+  });
+}
+function stateOf(n){ return STATE_META[n.state] ? n.state : 'awake'; }
+
+/* 十六进制混色：把 kind 色向状态灰蓝靠（canvas 兜底，不依赖 color-mix） */
+function hexRGB(c){
+  const s = String(c || '').trim();
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(s);
+  if (!m) return null;
+  let h = m[1];
+  if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+}
+function mixHex(base, tint, t){
+  const a = hexRGB(base); const b = hexRGB(tint);
+  if (!a || !b || !t) return base;
+  const ch = i => Math.round(a[i] + (b[i] - a[i]) * t);
+  return 'rgb(' + ch(0) + ',' + ch(1) + ',' + ch(2) + ')';
+}
+
+function lastWakeText(ts){
+  const t = Number(ts) || 0;
+  if (!t) return '从未唤醒';
+  const days = (Date.now()/1000 - t) / 86400;
+  if (!isFinite(days) || days < 0) return '从未唤醒';
+  if (days < 1) return '今天';
+  return Math.floor(days) + ' 天前';
+}
+function stateBadge(n){
+  const st = STATE_META[stateOf(n)];
+  const label = n.state_label || st.label;
+  return '<span class="sb"><span class="sb-d" style="background:' + st.tint + '"></span>' + esc(label) + '</span>';
+}
+
 async function load(){
   let d = EMBEDDED;
   if (location.protocol.startsWith('http')) {
@@ -364,9 +448,10 @@ function build(){
   const core = {
     id: CORE_ID, title: '我', kind: 'core', project: '', tags: ['core'],
     salience: 1, pinned: true, status: 'active', created_at: Math.floor(Date.now()/1000),
-    valid_to: 0, degree: raw.length, preview: '记忆核心：所有记忆都属于你、围绕你组织。'
+    valid_to: 0, degree: raw.length, preview: '记忆核心：所有记忆都属于你、围绕你组织。',
+    state: 'awake', state_label: '清醒', activation: 1, wake_count: 0, last_wake_at: 0
   };
-  DATA.nodes = [core].concat(raw);
+  DATA.nodes = [core].concat(raw.map(normNode));
   DATA.edges = (DATA.edges || []).concat(raw.map(n => ({source: CORE_ID, target: n.id, rel: 'core', w: 0.25})));
   nodes = DATA.nodes.map(n => Object.assign({}, n, {
     x: (Math.random()-.5)*600, y:(Math.random()-.5)*600, vx:0, vy:0, r:6
@@ -473,6 +558,7 @@ function resize(){
 function visible(n){
   if (n.id === CORE_ID) return true;
   if (!activeKinds.has(n.kind)) return false;
+  if (activeStates.size && !activeStates.has(stateOf(n))) return false;
   if (project && n.project !== project) return false;
   if (!showRetired && n.status && n.status !== 'active') return false;
   if (query){
@@ -515,16 +601,25 @@ function render(){
   nodes.forEach(n => {
     if (!visible(n)) return;
     const lit = !near || near.has(n.id);
-    const col = KIND_COLOR[n.kind] || '#64748b';
-    ctx.globalAlpha = lit ? 1 : 0.3;
+    const isCore = n.id === CORE_ID;
+    const kindCol = KIND_COLOR[n.kind] || '#64748b';
+    const st = STATE_META[stateOf(n)] || STATE_META.awake;
+    const isFocus = n === hovered || (selected && n.id === selected.id);
+    const litA = lit ? 1 : 0.3;
+    // 状态透明度叠加邻域变暗；hover / 选中时把状态透明度抬回可读
+    const alpha = Math.min(1, (st.alpha + (1 - st.alpha) * (isFocus ? 0.9 : 0)) * litA);
+    const col = isCore ? kindCol : mixHex(kindCol, st.tint, st.mix);
+    const dash = isFocus ? null : st.dash;   // 选中/悬停一律实线，可读性优先
     const retired = n.status && n.status !== 'active';
     // halo
-    if (n.pinned || n.id === selected){
-      ctx.beginPath(); ctx.arc(n.x, n.y, (n.rNow||n.r) + 4/view.k, 0, Math.PI*2);
-      ctx.strokeStyle = col; ctx.globalAlpha = (lit?0.6:0.22);
-      ctx.lineWidth = 1.6/view.k; ctx.stroke(); ctx.globalAlpha = lit ? 1 : 0.3;
+    if (n.pinned || (selected && n.id === selected.id)){
+      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(n.x, n.y, (n.rNow||n.r) * st.rMul + 4/view.k, 0, Math.PI*2);
+      ctx.strokeStyle = st.mix > 0 ? st.tint : col;
+      ctx.globalAlpha = Math.min(1, (lit ? 0.6 : 0.22) + (isFocus ? 0.28 : 0));
+      ctx.lineWidth = 1.6/view.k; ctx.stroke();
     }
-    if (n.id === CORE_ID){
+    if (isCore){
       const g = ctx.createRadialGradient(n.x, n.y, 2, n.x, n.y, n.r*2.6);
       g.addColorStop(0, 'rgba(190,205,255,.95)');
       g.addColorStop(.45, 'rgba(120,145,255,.35)');
@@ -532,13 +627,19 @@ function render(){
       ctx.beginPath(); ctx.arc(n.x, n.y, n.r*2.6, 0, Math.PI*2);
       ctx.fillStyle = g; ctx.fill();
     }
-    const rr = n.id === CORE_ID ? n.r : (n.rNow || n.r);
+    const rr = isCore ? n.r : (n.rNow || n.r) * st.rMul;
+    ctx.globalAlpha = alpha;
     ctx.beginPath(); ctx.arc(n.x, n.y, rr, 0, Math.PI*2);
-    ctx.fillStyle = retired ? 'transparent' : (n.id === CORE_ID ? (getComputedStyle(document.body).color || '#E9ECF5') : col);
+    ctx.fillStyle = retired ? 'transparent' : (isCore ? (getComputedStyle(document.body).color || '#E9ECF5') : col);
     ctx.fill();
+    if (dash) ctx.setLineDash(dash.map(d => d / view.k)); else ctx.setLineDash([]);
     ctx.lineWidth = 1.4/view.k;
-    ctx.strokeStyle = retired ? col : 'color-mix(in srgb, ' + col + ' 55%, transparent)';
+    ctx.strokeStyle = retired ? col
+      : (st.mix > 0 ? st.tint : 'color-mix(in srgb, ' + col + ' 55%, transparent)');
+    // 虚线环用更高的不透明度勾边：小半径的沉睡点靠环"still alive"
+    ctx.globalAlpha = dash ? Math.min(1, Math.max(alpha, st.ring * litA)) : alpha;
     ctx.stroke();
+    ctx.setLineDash([]);
 
     // core label is drawn in the screen space pass
   });
@@ -568,7 +669,9 @@ function render(){
       const box = [bx - 2, by - 8, w + 4, 16];
       if (placed.some(p => !(box[0] > p[0]+p[2] || box[0]+box[2] < p[0] || box[1] > p[1]+p[3] || box[1]+box[3] < p[1]))) continue;
       placed.push(box);
-      ctx.globalAlpha = focus ? 0.98 : 0.72;
+      const lblSt = STATE_META[stateOf(n)] || STATE_META.awake;
+      const stFade = lblSt.alpha >= 1 ? 1 : (0.45 + 0.55 * lblSt.alpha);
+      ctx.globalAlpha = (focus ? 0.98 : 0.72 * stFade);
       ctx.fillStyle = n.id === CORE_ID ? ink : ink;
       ctx.textAlign = n.id === CORE_ID ? 'center' : 'left';
       ctx.fillText(label, bx + (n.id === CORE_ID ? w / 2 : 0), by);
@@ -713,7 +816,7 @@ function showBubble(n, sx, sy){
   const d = new Date((n.created_at||0)*1000);
   const date = isNaN(d) ? '' : d.toLocaleDateString('zh-CN');
   b.innerHTML = `<div class="bt">${esc(n.title)}</div>
-    <div class="bm">${esc(n.kind)} · ${esc(n.project||'—')} · ${date} · 连接 ${n.deg||0}</div>
+    <div class="bm">${n.id === CORE_ID ? '' : stateBadge(n) + ' '}${esc(n.kind)} · ${esc(n.project||'—')} · ${date} · 连接 ${n.deg||0}${n.id === CORE_ID ? '' : ' · 激活 ' + (typeof n.activation === 'number' ? n.activation.toFixed(2) : '1.00')}</div>
     <div class="bp">${esc((n.preview||'').slice(0, 260))}</div>
     ${(n.tags||[]).slice(0,4).map(t=>`<span class="bk">${esc(t)}</span>`).join('')}`;
   b.style.left = Math.min(sx + 16, W - 360) + 'px';
@@ -736,14 +839,16 @@ function select(id){
   selected = byId.get(id) || null;
   if (!selected) return;
   document.getElementById('panel').classList.add('open');
-  document.getElementById('ptitle').textContent = selected.title;
+  document.getElementById('ptitle').textContent =
+    ((selected.tags || []).indexOf('pitfall') >= 0 ? '⚠ ' : '') + selected.title;
   const d = new Date((selected.created_at||0)*1000);
   const date = isNaN(d) ? '' : d.toLocaleDateString('zh-CN');
   const rels = edges.filter(e => e.source===id || e.target===id).map(e => {
     const other = e.source===id ? e.target : e.source;
     const o = byId.get(other); if (!o) return '';
     return `<div class="lk" data-id="${o.id}"><span class="rel">${esc(e.rel)}</span>
-      <span class="nm" style="color:${KIND_COLOR[o.kind]||'#94a3b8'}">${esc(o.title)}</span></div>`;
+      ${o.id === CORE_ID ? '' : stateBadge(o)}
+      <span class="nm" style="flex:1;color:${KIND_COLOR[o.kind]||'#94a3b8'}">${esc(o.title)}</span></div>`;
   }).join('') || '<div class="empty">无关联</div>';
   if (id === CORE_ID){
     const total = nodes.length - 1;
@@ -760,18 +865,42 @@ function select(id){
         `<span class="tag" style="color:${KIND_COLOR[k]||'#94a3b8'}">${esc(k)} ${kinds[k]}</span>`).join('')}</div>
       <div class="section-title" style="margin:12px 0 6px">连接最多的记忆</div>
       <div class="links">${hubs.map(h=>`<div class="lk" data-id="${h.id}">
-        <span class="rel">${h.deg} 条</span>
-        <span class="nm" style="color:${KIND_COLOR[h.kind]||'#94a3b8'}">${esc(h.title)}</span></div>`).join('')}</div>`;
+        <span class="rel">${h.deg} 条</span>${stateBadge(h)}
+        <span class="nm" style="flex:1;color:${KIND_COLOR[h.kind]||'#94a3b8'}">${esc(h.title)}</span></div>`).join('')}</div>`;
     document.querySelectorAll('#pbody .lk').forEach(el => el.addEventListener('click', () => select(el.dataset.id)));
     render();
     return;
   }
   const status = selected.status && selected.status !== 'active' ? selected.status : 'active';
+  const actv = typeof selected.activation === 'number' ? selected.activation : 1;
+  const wakeN = Number(selected.wake_count) || 0;
+  const stKey = stateOf(selected);
+  const ageD = Number(selected.age_days);          // 这段记忆存在多久（从写入算）
+  const touchD = Number(selected.since_touch_days); // 多久没被想起 → 沉睡天数
+  const extraKv = [];
+  if (isFinite(ageD)) extraKv.push(`<span>记忆龄 <i>${Math.round(ageD)} 天</i></span>`);
+  if ((stKey === 'dormant' || stKey === 'deep') && isFinite(touchD))
+    extraKv.push(`<span>已沉睡 <i>${Math.round(touchD)} 天</i></span>`);
+  const stateRow = `
+    <div class="kv">
+      <span>状态 ${stateBadge(selected)}</span>
+      <span>激活度 <i>${actv.toFixed(2)}</i></span>
+      <span>唤醒 <i>${wakeN}</i> 次</span>
+      <span>最近唤醒 <i>${esc(lastWakeText(selected.last_wake_at))}</i></span>
+      ${extraKv.join('')}
+    </div>
+    <div class="hint" style="margin:-4px 0 12px">静态页不写入记忆 · 唤醒请用 <code>mem wake ${esc(selected.id)}</code></div>`;
+  // 静态页（file://）没有后端：写入类按钮保留视觉但禁用，避免点了弹"操作失败"
+  const lockAttr = (extraDisabled) => {
+    const dis = extraDisabled || !LIVE;
+    const tip = LIVE ? '' : ' title="静态页不支持写入 · 请用 mem serve 打开"';
+    return (dis ? ' disabled' : '') + tip;
+  };
   const acts = `
     <div class="acts">
-      <button data-act="${selected.pinned ? 'unpin' : 'pin'}">${selected.pinned ? '取消置顶' : '置顶'}</button>
-      <button data-act="retire" ${status !== 'active' ? 'disabled' : ''}>标记失效</button>
-      <button data-act="forget" class="danger">删除</button>
+      <button data-act="${selected.pinned ? 'unpin' : 'pin'}"${lockAttr(false)}>${selected.pinned ? '取消置顶' : '置顶'}</button>
+      <button data-act="retire"${lockAttr(status !== 'active')}>标记失效</button>
+      <button data-act="forget" class="danger"${lockAttr(false)}>删除</button>
       <button data-act="copy">复制 ID</button>
     </div>`;
   document.getElementById('pbody').innerHTML = `
@@ -782,6 +911,7 @@ function select(id){
       <span>连接 <i>${selected.deg||0}</i></span>
       ${selected.status && selected.status!=='active' ? `<span style="color:#ef4444">${esc(selected.status)}</span>`:''}
     </div>
+    ${stateRow}
     ${acts}
     <div>${(selected.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}</div>
     <div class="body">${esc(selected.preview || '')}</div>
@@ -824,8 +954,19 @@ function closePanel(){
 function updateMeta(){
   const vis = nodes.filter(visible).length;
   const m = DATA.meta || {};
+  const sc = {awake:0, fuzzy:0, dormant:0, deep:0};
+  let total = 0;
+  nodes.forEach(n => { if (n.id === CORE_ID) return; total++; sc[stateOf(n)]++; });
+  const pct = total ? Math.round(sc.awake / total * 100) : 0;
+  const pits = nodes.filter(n => n.id !== CORE_ID && (n.tags || []).indexOf('pitfall') >= 0).length;
+  const dist = STATE_ORDER.map(k =>
+    `<span><span class="sw" style="background:${STATE_META[k].tint}"></span>${STATE_META[k].label} <b>${sc[k]}</b></span>`
+  ).join('');
   document.getElementById('meta').innerHTML =
     `<b>${vis}</b> / ${nodes.length} 节点 · <b>${edges.length}</b> 条关联<br>` +
+    `状态分布<div class="dist">${dist}</div>` +
+    `<div class="rate"><span class="bar"><i style="width:${pct}%"></i></span>清醒率 <b>${pct}%</b></div>` +
+    (pits ? `<div class="pits">已知雷区 <b>${pits}</b> 条 · 动手前 <code>mem preflight</code></div>` : '') +
     `生成 ${m.generated ? new Date(m.generated*1000).toLocaleString('zh-CN') : '—'}<br>` +
     `数据 <code>~/.dsh/memory/memory.db</code>`;
   document.getElementById('qhint').textContent = query
@@ -843,6 +984,25 @@ function chips(){
     const k = el.dataset.k;
     if (activeKinds.has(k)) activeKinds.delete(k); else activeKinds.add(k);
     el.classList.toggle('on'); el.classList.toggle('off'); updateMeta(); render();
+  }));
+
+  // 状态分组：与类型过滤互不干扰，默认全开
+  const sbox = document.getElementById('states');
+  const sc = {awake:0, fuzzy:0, dormant:0, deep:0};
+  nodes.forEach(n => { if (n.id !== CORE_ID) sc[stateOf(n)]++; });
+  sbox.innerHTML = STATE_ORDER.map(k =>
+    `<span class="chip ${activeStates.has(k)?'on':'off'}" data-s="${k}">
+       <span class="sw" style="background:${STATE_META[k].tint}"></span>${STATE_META[k].label} ${sc[k]}</span>`).join('');
+  sbox.querySelectorAll('.chip').forEach(el => el.addEventListener('click', () => {
+    const k = el.dataset.s;
+    if (activeStates.has(k)) activeStates.delete(k); else activeStates.add(k);
+    el.classList.toggle('on'); el.classList.toggle('off');
+    // 全关会让图只剩核心：自动回到全开，避免"白屏"
+    if (!activeStates.size || activeStates.size > STATE_ORDER.length){
+      activeStates = new Set(STATE_ORDER);
+      chips();
+    }
+    updateMeta(); render();
   }));
 }
 
