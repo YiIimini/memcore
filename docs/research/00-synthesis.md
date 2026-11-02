@@ -134,7 +134,22 @@ R@1/R@3 仍是 **10/12、11/12，MRR 0.881 → 0.881**；把注入强度拉到 4
 
 ---
 
-## 7. 来源
+## 7. 已落地（2026-11-02 当天做完，含回归）
+
+| # | 落地 | 借自 | 验证 |
+|---|---|---|---|
+| ⑥ | BM25 → sigmoid 归一化（按查询长度取 `(m0,k)`）；`evidence` 改为"是否走过词法通道"而非"归一化后 > 0" | Mem0 `scoring.py` | R@1 10/12→11/12，R@3 11/12→12/12 |
+| ① | 实体通道：`extract_entities()` 写入期抽别名（CJK 2~4 元 + 拉丁词 + 文件名主干）、查询期按 n 元撞、`1/log(1+df)` hub 抑制、`weights.tag/entity` 分开可配；新增 `backfill_entities()` 并挂进 `maintain()` | Mem0 entity linking / A-MEM keywords / HippoRAG hub 抑制 | R@1 11/12→**12/12**；3000 条时实体通道 +3ms p50 |
+| ③ | `replace_in_body(old, new)` + `mem edit`：逐字、唯一、0 次或多次都报错并列行号 | Letta `memory_replace` | 单测覆盖三种失败态 |
+| ⑨ | `add(event_at=)` + `--event-at`：`valid_from` 不再恒等于写入时间（不传回落写入时间，**不写 0**） | Graphiti 双时态 | 单测断言 `valid_from != 0` |
+| ⑤ | `recall` 空结果显式回落并标注（`preflight` 保持不回落） | HippoRAG fallback | 单测覆盖"不伪装成命中" |
+
+> 反例留档：实体通道**先只补写入、仍用 0.05 硬编码加成**时，R@1/R@3 一点没动（§5 的实验）。
+> 这条机制必须"写入 + 独立权重 + hub 抑制"三件一起上才有用。
+
+---
+
+## 8. 来源
 
 各分报告末尾都有 3~8 条带 URL 的原始来源（raw 源码路径 + 论文 + 官方 docs）。
 汇总入口：

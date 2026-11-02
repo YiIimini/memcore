@@ -232,6 +232,17 @@ $M search "推流参数" --json       # 每条结果带 state / state_label / ac
 
 配置都在 `config.json` 的 `dormancy` 段（阈值、权重、保质期、冷却、雾化比例），改完重启面板生效。
 
+## 4.5.1 这一轮从调研里落地的（都有回归）
+
+| 落地 | 借自 | 效果（`tests_eval.py` 12 条） |
+|---|---|---|
+| BM25 归一化换成 sigmoid（按查询长度取阈值） | Mem0 `scoring.py` | R@1 10/12 → 11/12，R@3 11/12 → **12/12** |
+| **实体通道**：写入期抽别名词（CJK 2~4 元 + 拉丁词 + 文件名主干）、查询期按 n 元撞、`1/log(1+df)` 抑制高频实体、权重可配 | Mem0 entity linking、A-MEM keywords、HippoRAG hub 抑制 | R@1 11/12 → **12/12**（`entities` 之前是 0 行的死表） |
+| `mem edit --old --new` 定点改记忆（逐字 + 唯一，0 次/多次直接报错并列行号） | Letta `memory_replace` | 不再"整字段覆盖"式误改 |
+| `--event-at` 写入事件时间；`valid_from` 不再恒等于写入时间 | Graphiti 双时态的"业务时间"轴 | 为时点检索打底 |
+| `recall` 空结果**显式标注**回落（`preflight` 永不回落） | HippoRAG fallback | 不再静默返回空 |
+| 雷区不进普通召回（问"坑/雷区/教训"才带出） | 自研（本轮实测） | 元记忆不抢业务记忆的席位 |
+
 ## 4.55 调研笔记：别人怎么做的
 
 `docs/research/` 是一份 9 个记忆系统的源码级拆解（Mem0、Letta、Zep/Graphiti、Cognee、A-MEM、HippoRAG、

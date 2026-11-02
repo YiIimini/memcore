@@ -296,6 +296,92 @@ class TestGraphFeatures(Base):
         self.assertEqual(meta.get("retire_reason"), "改用别的方案")
 
 
+class TestEntityChannel(Base):
+    """实体通道：写入期抽别名，检索期按 n 元撞，hub 按 df 抑制。"""
+
+    def test_add_writes_entities(self):
+        mid = self.m.add("直播平台接入方案落地", title="dsh-pet-AI直播实现方案",
+                         kind="artifact", tags=["直播"])["id"]
+        names = {r["name"] for r in self.m.db.execute(
+            "SELECT name FROM entities WHERE memory_id=?", (mid,))}
+        self.assertTrue(names, "add 必须写实体，否则 ent 信号永远是空的")
+        self.assertIn("直播", names)
+        self.assertIn("dsh-pet-ai", names)
+
+    def test_cjk_gram_query_hits_alias(self):
+        """中文长句没有分词：整句当词撞不到实体，靠 n 元才命中。"""
+        mid = self.m.add("产物 路径：dsh-pet-AI直播实现方案.md",
+                         title="产物 dsh-pet-AI直播实现方案", kind="artifact")["id"]
+        hits = [h["id"] for h in self.m.search("直播宠物整体方案写到哪个文件")]
+        self.assertIn(mid, hits)
+
+    def test_hub_suppression(self):
+        """到处都有的实体要降权，否则"方案"这种词给全库加分。"""
+        common, rare = [], []
+        for i in range(6):
+            common.append(self.m.add("通用方案 %d" % i, title="通用方案 %d" % i, kind="note")["id"])
+        rare_id = self.m.add("独有词 量子纠缠调参", title="量子纠缠调参", kind="note")["id"]
+        cand = self.m._select_candidates("量子纠缠 方案")
+        self.assertGreater(cand[rare_id]["ent"], cand[common[0]].get("ent", 0.0))
+
+    def test_backfill_entities_for_old_rows(self):
+        mid = self.m.add("老数据", title="老方案标题", kind="note")["id"]
+        self.m.db.execute("DELETE FROM entities")      # 模拟老库：实体表是空的
+        self.m.db.commit()
+        self.assertEqual(self.m.backfill_entities(), 1)
+        self.assertTrue(self.m.db.execute(
+            "SELECT count(*) c FROM entities WHERE memory_id=?", (mid,)).fetchone()["c"])
+
+
+class TestPointEdit(Base):
+    """定点改记忆（Letta memory_replace 契约）：逐字、唯一、改不动就报错。"""
+
+    def test_unique_replace(self):
+        mid = self.m.add("端口 8080 用于预览。", title="预览", kind="fact")["id"]
+        r = self.m.replace_in_body(mid, "8080", "9090")
+        self.assertTrue(r["ok"])
+        self.assertIn("9090", self.m.get(mid)["body"])
+
+    def test_missing_old_fails_loudly(self):
+        mid = self.m.add("端口 8080 用于预览。", title="预览", kind="fact")["id"]
+        r = self.m.replace_in_body(mid, "端口 8081", "9090")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["count"], 0)
+        self.assertIn("未逐字找到", r["error"])
+
+    def test_ambiguous_old_lists_lines(self):
+        mid = self.m.add("端口 8080\n端口 8080", title="两处", kind="fact")["id"]
+        r = self.m.replace_in_body(mid, "端口 8080", "9090")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["count"], 2)
+        self.assertEqual(r["lines"], [1, 2])
+        self.assertTrue(self.m.replace_in_body(mid, "端口 8080", "9090", replace_all=True)["ok"])
+
+
+class TestRetrievalErgonomics(Base):
+    """两个"别静默失败"的兜底：事件时间入口、空结果回落。"""
+
+    def test_event_at_sets_valid_from_not_zero(self):
+        ts = 1757865600            # 2025-09-15
+        mid = self.m.add("当时定的方案", title="历史决定", kind="decision", event_at=ts)["id"]
+        self.assertEqual(self.m.get(mid)["valid_from"], ts)
+        # 不传 event_at 时回落写入时间，绝不能是 0（0 在 as_of 语义里等于"无下界"）
+        mid2 = self.m.add("今天定的", title="新决定", kind="decision")["id"]
+        self.assertNotEqual(self.m.get(mid2)["valid_from"], 0)
+
+    def test_recall_falls_back_with_explicit_label(self):
+        self.m.add("唯一一条记忆", title="孤本", kind="fact")
+        r = self.m.recall("zzqqxxvv", budget_tokens=200)
+        self.assertIn("无匹配", r["text"])
+        self.assertIn("不是匹配结果", r["text"])
+        self.assertTrue(all(i.get("fallback") for i in r["items"]))
+
+    def test_preflight_never_falls_back(self):
+        """preflight 的语义是"没坑就是没坑"，不能兜底。"""
+        r = self.m.preflight(["no_such_file.py"])
+        self.assertNotIn("回落", r["text"])
+
+
 class TestPreflight(Base):
     """动手前查雷区：坑按文件名归档，preflight 必须把它捞出来。"""
 

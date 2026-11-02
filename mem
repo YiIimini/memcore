@@ -85,6 +85,8 @@ def main(argv=None) -> int:
     p.add_argument("--no-dedupe", action="store_true")
     p.add_argument("--trigger", default="",
                    help="显式触发词（逗号分隔）：查询里出现就唤醒这条记忆")
+    p.add_argument("--event-at", default=None,
+                   help="事实发生的时间（YYYY-MM-DD 或 epoch）；不传=写入时间")
 
     for name in ("search", "s"):
         p = sub.add_parser(name, help="ranked search")
@@ -124,6 +126,13 @@ def main(argv=None) -> int:
     p.add_argument("--pin", dest="pinned", action="store_true")
     p.add_argument("--unpin", dest="pinned", action="store_false")
     p.add_argument("--trigger", help="显式触发词（逗号分隔），传空串表示清空")
+
+    p = sub.add_parser("edit", parents=[common],
+                       help="定点改记忆正文（old 必须逐字且唯一，仿 Letta memory_replace）")
+    p.add_argument("id")
+    p.add_argument("--old", required=True, help="要替换的原文片段（逐字）")
+    p.add_argument("--new", required=True, help="替换成什么")
+    p.add_argument("--all", action="store_true", help="允许 old 出现多次并全部替换")
 
     p = sub.add_parser("forget", parents=[common], help="delete one memory")
     p.add_argument("id")
@@ -233,7 +242,8 @@ def main(argv=None) -> int:
             r = m.add(args.body, title=args.title, kind=args.kind, tags=tags, project=args.project,
                       source=args.source, source_ref=args.source_ref, salience=args.salience,
                       confidence=args.confidence, pinned=args.pin, ttl_days=args.ttl_days,
-                      dedupe=not args.no_dedupe, meta=meta)
+                      dedupe=not args.no_dedupe, meta=meta,
+                      event_at=parse_when(args.event_at))
             m.export_markdown()
             if args.json:
                 dump(r)
@@ -331,6 +341,17 @@ def main(argv=None) -> int:
             m.export_markdown()
             out("updated" if ok else "no-op")
             return 0 if ok else 1
+
+        if args.cmd == "edit":
+            r = m.replace_in_body(args.id, args.old, args.new, replace_all=args.all)
+            if args.json:
+                dump(r)
+            elif r["ok"]:
+                out("已定点替换 %d 处" % r["replaced"])
+            else:
+                out("改不动：%s%s" % (r["error"],
+                                     ("（第 %s 行都有）" % r["lines"]) if r.get("lines") else ""))
+            return 0 if r["ok"] else 1
 
         if args.cmd == "forget":
             ok = m.forget(args.id)

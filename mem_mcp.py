@@ -69,6 +69,8 @@ TOOLS = [
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "project": {"type": "string", "default": ""},
                 "pinned": {"type": "boolean", "default": False},
+                "event_at": {"type": "integer",
+                             "description": "epoch seconds when the fact actually happened (default: now)"},
             },
             "required": ["body"],
         },
@@ -175,7 +177,8 @@ def call_tool(m: Memory, name: str, args: dict):
     if name == "memory_add":
         r = m.add(args.get("body", ""), title=args.get("title", ""), kind=args.get("kind", "note"),
                   tags=args.get("tags") or [], project=args.get("project", ""),
-                  source="mcp", pinned=bool(args.get("pinned")))
+                  source="mcp", pinned=bool(args.get("pinned")),
+                  event_at=args.get("event_at"))
         m.export_markdown()
         return _text("stored %s%s" % (r["id"], " (deduped: %s)" % r["deduped"] if r.get("deduped") else ""))
     if name == "memory_get":

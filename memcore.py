@@ -74,7 +74,13 @@ DEFAULT_CONFIG = {
         "salience": 0.10,
         "reinforce": 0.08,
         "pinned": 0.15,
+        # 标签/实体是两条独立通道，不是同一个 0.05 常数（旧代码把两者相加乘 0.05，
+        # 等于给任何信号都稀释成噪声 —— 实体表因此一直是死表也没人发现）
+        "tag": 0.05,
+        "entity": 0.12,
     },
+    # 检索空结果时是否回落（只在"该有答案"的通道上开：recall 开，preflight 永不开）
+    "recall": {"fallback": True, "fallback_n": 6},
     "mmr_lambda": 0.72,
     "dedupe_exact": True,
     "dedupe_fuzzy": 0.965,
@@ -183,6 +189,36 @@ def mask_text(text: str, seed: str, keep_head: float = 0.35, keep_tail: float = 
             buf.append(ch)
             run = 0
     return (s[:head] + "".join(buf) + s[len(s) - tail:]).strip()
+
+
+LATIN_TOK_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.\-]{1,24}")
+CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+
+
+def extract_entities(title: str, tags: Sequence[str] = (), limit: int = 14) -> List[str]:
+    """写入期抽取"这条记忆能被什么词叫醒"。
+
+    名字即别名：标题里的 CJK 2~4 元、拉丁词与文件名主干。
+    中文没有分词，所以按 n 元存 —— 查询侧同样按 n 元去撞，长句才命中得了。
+    """
+    text = " ".join([title or "", " ".join(tags or [])])
+    out: List[str] = []
+    for w in LATIN_TOK_RE.findall(text):
+        w = w.lower()
+        out.append(w)
+        stem = w.split(".")[0]
+        if stem and stem != w:
+            out.append(stem)
+    for run in CJK_RUN_RE.findall(title or ""):
+        for n in (2, 3, 4):
+            for i in range(len(run) - n + 1):
+                out.append(run[i:i + n])
+    seen: List[str] = []
+    for e in out:
+        e = e.strip("._-")
+        if len(e) >= 2 and e not in seen:
+            seen.append(e)
+    return seen[: max(1, int(limit))]
 
 
 def safe_base_url(base: str) -> bool:
@@ -574,6 +610,7 @@ class Memory:
     def maintain(self) -> Dict[str, Any]:
         """One-shot routine: ingest new sessions, add edges, gc, rebuild mirror."""
         ing = self.ingest_sessions()
+        ents = self.backfill_entities()
         edges = self.relink(rebuild=False)
         # 先落快照再执行破坏性 gc：否则误判只能对着「删完之后」的库叹气
         pre = None
@@ -598,7 +635,7 @@ class Memory:
                 json.dump(self.cfg, fh, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        return {"ingest": ing, "new_edges": edges, "gc": g["removed"],
+        return {"ingest": ing, "entities": ents, "new_edges": edges, "gc": g["removed"],
                 "backup": os.path.basename(backup) if backup else "",
                 "total": self.stats()["total"]}
 
@@ -656,6 +693,7 @@ class Memory:
         status: str = "active",
         autolink: Optional[bool] = None,
         touch: bool = True,
+        event_at: Optional[int] = None,
     ) -> Dict[str, Any]:
         kind = kind if kind in KIND_DEFAULTS else "note"
         body = norm_text(body)
@@ -712,13 +750,19 @@ class Memory:
                 (mid, kind, title, body, project, "global", ",".join(tags), source, source_ref,
                  t, t, 0, 0, float(salience), float(confidence), 1 if pinned else 0, int(ttl_days),
                  h, json.dumps(meta or {}, ensure_ascii=False), int(mid[1:]), sim,
-                 int(valid_from or t), int(valid_to), status),
+                 # event_at = 事实发生的时间（双时态的"业务时间"轴）；
+                 # 不传就回落到写入时间 ts —— 绝不写 0，0 在 as_of 语义里等于"无下界"
+                 int(event_at or valid_from or t), int(valid_to), status),
             )
             self.db.execute("INSERT INTO mem_fts(memory_id, text) VALUES(?,?)",
                             (mid, " ".join([title, body, " ".join(tags), project])))
             self.db.execute("INSERT INTO vectors(memory_id, v) VALUES(?,?)", (mid, v))
             for tg in tags:
                 self.db.execute("INSERT OR IGNORE INTO tags(memory_id,tag) VALUES(?,?)", (mid, tg))
+            for ent in extract_entities(title, tags):
+                self.db.execute(
+                    "INSERT OR IGNORE INTO entities(memory_id,name,etype) VALUES(?,?,?)",
+                    (mid, ent, "alias"))
         do_link = self.cfg.get("autolink", {}).get("enabled", True) if autolink is None else autolink
         if do_link:
             try:
@@ -781,6 +825,11 @@ class Memory:
                     self.db.execute("INSERT OR IGNORE INTO tags(memory_id,tag) VALUES(?,?)", (mid, tg))
             r = self.db.execute(
                 "SELECT title, body, tags, project, kind FROM memories WHERE id=?", (mid,)).fetchone()
+            self.db.execute("DELETE FROM entities WHERE memory_id=?", (mid,))
+            for ent in extract_entities(r["title"], (r["tags"] or "").split(",")):
+                self.db.execute(
+                    "INSERT OR IGNORE INTO entities(memory_id,name,etype) VALUES(?,?,?)",
+                    (mid, ent, "alias"))
             self.db.execute("DELETE FROM mem_fts WHERE memory_id=?", (mid,))
             self.db.execute("INSERT INTO mem_fts(memory_id, text) VALUES(?,?)",
                             (mid, " ".join([r["title"], r["body"], r["tags"], r["project"]])))
@@ -795,6 +844,32 @@ class Memory:
                             (simhash(r["title"] + "\n" + r["body"]), mid))
         self._journal("update", mid, {k: v for k, v in fields.items() if k != "body"})
         return True
+
+    def replace_in_body(self, mid: str, old: str, new: str,
+                        require_unique: bool = True, replace_all: bool = False) -> Dict[str, Any]:
+        """定点改记忆：old 必须逐字出现（且默认必须唯一）。
+
+        借 Letta `memory_replace` 的契约：整字段覆盖是"幻觉原文"和"改错位置"的温床 ——
+        模型记错一个字就静默改到别处，而定点替换会直接失败并把歧义行号摊出来。
+        """
+        row = self.get(mid)
+        if not row:
+            return {"ok": False, "error": "not found", "count": 0}
+        body = row.get("body") or ""
+        if not old:
+            return {"ok": False, "error": "old 不能为空", "count": 0}
+        count = body.count(old)
+        if count == 0:
+            return {"ok": False, "error": "old 未逐字找到", "count": 0,
+                    "hint": "把要改的片段原样贴进来（不要凭印象重写）"}
+        if count > 1 and require_unique and not replace_all:
+            lines = [i + 1 for i, ln in enumerate(body.splitlines()) if old in ln]
+            return {"ok": False, "error": "old 出现 %d 次，不唯一" % count,
+                    "count": count, "lines": lines,
+                    "hint": "多带一点上下文让它唯一，或显式 replace_all"}
+        new_body = body.replace(old, new) if replace_all else body.replace(old, new, 1)
+        ok = self.update(mid, body=new_body)
+        return {"ok": bool(ok), "count": count, "replaced": count if replace_all else 1}
 
     def forget(self, mid: str) -> bool:
         row = self.get(mid)
@@ -1376,8 +1451,38 @@ class Memory:
         for t in tset[:10]:
             for r in self.db.execute("SELECT memory_id FROM tags WHERE tag=?", (t,)):
                 cand.setdefault(r["memory_id"], {})["tag"] = 1.0
-            for r in self.db.execute("SELECT memory_id FROM entities WHERE name=?", (t,)):
-                cand.setdefault(r["memory_id"], {})["ent"] = 1.0
+            rows_e = list(self.db.execute(
+                "SELECT memory_id FROM entities WHERE name=?", (t,)))
+            if rows_e:
+                # 整词命中也要做 df 抑制：否则"方案"这种词给每条记忆都加满同样的分
+                df = len(rows_e)
+                wgt = round(1.0 / math.log(1 + df + 1), 4)
+                for r in rows_e:
+                    cur = cand.setdefault(r["memory_id"], {})
+                    if cur.get("ent", 0.0) < wgt:
+                        cur["ent"] = wgt
+                    cur["ent_exact"] = max(cur.get("ent_exact", 0.0), wgt)
+
+        # 2a) 实体通道：中文没有分词，整句当词只能撞到完全同名的实体，
+        #     所以像写入端一样按 n 元去撞。权重按 df 抑制（HippoRAG 的 hub 抑制）：
+        #     "方案""实现"这种到处都有的实体不该给任何一条记忆加分。
+        grams = sorted(_grams(q))[:16]
+        if grams:
+            # 一次拿齐 df 与命中行：每个 gram 单独查两次会变成 32 条 SQL，5k 条时能吃掉一半延迟
+            marks = ",".join("?" * len(grams))
+            hit_rows = list(self.db.execute(
+                "SELECT name, memory_id FROM entities WHERE name IN (%s)" % marks, grams))
+            df_cache = {r["name"]: 0 for r in hit_rows}
+            for r in hit_rows:
+                df_cache[r["name"]] += 1
+            for r in hit_rows:
+                df = df_cache.get(r["name"]) or 0
+                if df <= 0:
+                    continue
+                wgt = round(1.0 / math.log(1 + df + 1), 4)   # df=1 → 0.91，df=10 → 0.40
+                cur = cand.setdefault(r["memory_id"], {})
+                if cur.get("ent", 0.0) < wgt:
+                    cur["ent"] = wgt
 
         # 2b. title bigram scan (catches short CJK terms that trigram FTS cannot)
         qb = [g for g in list(_grams(q)) if len(g) == 2][:8]
@@ -1447,10 +1552,20 @@ class Memory:
         qg = _grams(q)
         ovl = {mid: dice(qg, _grams(r["title"] + " " + r["body"][:900])) for mid, r in rows.items()}
         tovl = {mid: dice(qg, _grams(r["title"])) for mid, r in rows.items()}
-        # lexical normalisation from candidate bm25 values (lower = better)
+        # 词法归一化：sigmoid 而不是 min-max。
+        # min-max 依赖候选集，只有一条候选时恒等于 1.0（旧代码注释里踩过这个坑）；
+        # sigmoid 是绝对刻度：raw≈阈值 → 0.5，与同批有几条候选无关。
+        # 参数按查询词数取（Mem0 scoring.py 同一思路）：短查询更容易是精确查询，阈值低一点。
         lex_raw = {mid: -float(cand[mid].get("bm25", 0.0)) for mid in rows}
-        lo, hi = min(lex_raw.values(), default=0.0), max(lex_raw.values(), default=0.0)
-        lexn = {m: ((lex_raw[m] - lo) / (hi - lo) if hi > lo else 0.0) for m in lex_raw}
+        # 查询越短越可能是精确查询：阈值放低；长句里关键词被稀释，阈值抬高
+        qlen = len(q or "")
+        if qlen <= 6:
+            m0, k = 5.0, 0.7
+        elif qlen <= 16:
+            m0, k = 9.0, 0.6
+        else:
+            m0, k = 12.0, 0.5
+        lexn = {m: 1.0 / (1.0 + math.exp(-k * (lex_raw[m] - m0))) for m in lex_raw}
 
         intent_file = bool(re.search(r"(文件|文档|路径|目录|哪份|哪篇|file|doc|path|directory)", q, re.I))
         t = now()
@@ -1486,8 +1601,9 @@ class Memory:
                      + (w["pinned"] if r["pinned"] else 0.0))
             if not pit_hint and PITFALL_TAG in (r["tags"] or ""):
                 continue
-            # tag/entity bonus
-            s += 0.05 * (cand[mid].get("tag", 0.0) + cand[mid].get("ent", 0.0))
+            # 标签与实体是两条独立通道，各有权重（不再是同一个 0.05 常数）
+            s += (w.get("tag", 0.05) * cand[mid].get("tag", 0.0)
+                  + w.get("entity", 0.12) * cand[mid].get("ent", 0.0))
             if project and r["project"] == project:
                 s += 0.06
             if intent_file and r["kind"] in ("artifact", "project"):
@@ -1498,7 +1614,8 @@ class Memory:
             contain = 0.80 if (ql and ql in tl) else 0.50 if (ql and ql in bl) else 0.0
             # 显式触发词：这条记忆自己声明的"想起它的暗号"
             cues = [c for c in self.memory_triggers(r) if c and c in ql]
-            evidence = (lexn.get(mid, 0.0) > 0.0 or sem.get(mid, 0.0) >= 0.12
+            has_lex = "bm25" in cand[mid]     # 走过词法通道即算证据，强度由 lexn 负责排序
+            evidence = (has_lex or sem.get(mid, 0.0) >= 0.12
                         or cand[mid].get("title")
                         or ovl.get(mid, 0.0) >= 0.22
                         or tovl.get(mid, 0.0) >= 0.20
@@ -1516,7 +1633,7 @@ class Memory:
                 "last_wake_at": 0, "wake_weight": 0.0, "sleep_override": "",
                 "next_state_in_days": None}
             state = st["state"]
-            exact = bool(cand[mid].get("tag") or cand[mid].get("ent") or cues)
+            exact = bool(cand[mid].get("tag") or cand[mid].get("ent_exact") or cues)
             # 触发强度只看绝对量：批量归一化过的 lexn 会让"只有一条结果的短查询"
             # 显得极端匹配，一句话就把整库叫醒。
             trigger = max(0.60 * ovl.get(mid, 0.0) + 0.40 * max(0.0, sem.get(mid, 0.0)), contain)
@@ -1600,10 +1717,34 @@ class Memory:
             if h.get("woke"):
                 woke.append(h["id"])
             self.reinforce(h["id"], 0.01)
+        fallback_used = False
+        if not items and bool((self.cfg.get("recall") or {}).get("fallback", True)) and (q := query.strip()):
+            # 明确标注的回落：没命中就明说"这是最近/最重要的，不是匹配结果"，
+            # 绝不伪装成命中（preflight 不这么做：没坑就是没坑）
+            n_fb = int((self.cfg.get("recall") or {}).get("fallback_n", 6))
+            for row in self.db.execute(
+                    "SELECT * FROM memories WHERE status='active' AND valid_to=0 "
+                    "ORDER BY pinned DESC, salience DESC, updated_at DESC LIMIT ?", (n_fb,)):
+                h = self._row_to_hit(dict(row))
+                h["fallback"] = True
+                line = self._format_hit(h, compact=True)
+                cost = est_tokens(line)
+                if used + cost > budget_tokens and items:
+                    break
+                items.append({"id": h["id"], "line": line, "score": h.get("score", 0.0),
+                              "state": h.get("state", "awake"), "woke": False,
+                              "fallback": True})
+                used += cost
+            fallback_used = bool(items)
+
         header = "# 记忆召回 · %s · %d 条 · ~%d tok" % (query[:60], len(items), used)
+        if fallback_used:
+            header += " · 无匹配，已回落到最近/最重要"
         if woke:
             header += " · 线索唤醒 %d 条" % len(woke)
         text = "\n".join([header] + [i["line"] for i in items])
+        if fallback_used:
+            text += "\n> 这些都不是匹配结果，只是最近写入/最重要的 — 换关键词，或先 mem add 补事实"
         if not items:
             text = header + "\n(无匹配；可放宽 --budget / 去掉过滤，或先 mem add 写入事实)"
         if woke:
@@ -1814,6 +1955,27 @@ class Memory:
                 self.forget(mid)
         return {"removed": len(dead), "ids": dead[:20]}
 
+    def backfill_entities(self, limit: int = 0) -> int:
+        """给存量记忆补实体索引（老库 entities 是空的，新增写入路径不会回溯）。"""
+        sql = ("SELECT id, title, tags FROM memories WHERE status='active' "
+               "AND id NOT IN (SELECT memory_id FROM entities)")
+        params: List[Any] = []
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = [dict(r) for r in self.db.execute(sql, params)]
+        n = 0
+        with self.db:
+            for r in rows:
+                for ent in extract_entities(r["title"], (r["tags"] or "").split(",")):
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO entities(memory_id,name,etype) VALUES(?,?,?)",
+                        (r["id"], ent, "alias"))
+                n += 1
+        if n:
+            self._journal("backfill_entities", "-", {"rows": n})
+        return n
+
     def reindex(self) -> int:
         n = 0
         with self.db:
@@ -1826,6 +1988,11 @@ class Memory:
                                 (r["id"], embed(r["title"] + "\n" + r["body"], self.dim)))
                 self.db.execute("UPDATE memories SET sim=? WHERE id=?",
                                 (simhash(r["title"] + "\n" + r["body"]), r["id"]))
+                self.db.execute("DELETE FROM entities WHERE memory_id=?", (r["id"],))
+                for ent in extract_entities(r["title"], (r["tags"] or "").split(",")):
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO entities(memory_id,name,etype) VALUES(?,?,?)",
+                        (r["id"], ent, "alias"))
                 n += 1
         return n
 
