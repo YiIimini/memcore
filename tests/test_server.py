@@ -202,5 +202,183 @@ class EngineGuards(unittest.TestCase):
             self.assertTrue(Memory._indexable_doc(p), p)
 
 
+class LifecycleApi(unittest.TestCase):
+    """记忆模糊/沉睡的 HTTP 出口：状态统计、沉睡区、手动唤醒与沉睡。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="memcore-life-")
+        cls.env = dict(os.environ, MEM_HOME=cls.tmp)
+        run = lambda *a: subprocess.run([sys.executable, os.path.join(ROOT, "mem")] + list(a),
+                                        env=cls.env, check=True, capture_output=True)
+        run("add", "-k", "episode", "-t", "沉睡的会话片段",
+            "-b", "斗鱼直播平台接入用的是原生桥，推流参数在 config/stream.yaml。")
+        run("add", "-k", "fact", "-t", "清醒的事实", "-b", "记忆面板配色要用配对前景 token。")
+        # 把 episode 拨回 6 天前：它应该沉下去，fact 还醒着
+        subprocess.run([sys.executable, "-c",
+                        "import sqlite3,time,os;"
+                        "db=sqlite3.connect(os.path.join(os.environ['MEM_HOME'],'memory.db'));"
+                        "db.execute(\"UPDATE memories SET updated_at=?, last_used_at=0, use_count=0 "
+                        "WHERE kind='episode'\",(int(time.time()-86400*6),));db.commit()"],
+                       env=cls.env, check=True)
+        cls.port = _free_port()
+        cls.proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "mem"), "serve", "--port", str(cls.port)],
+            env=cls.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _wait(cls.port):
+            cls.proc.kill()
+            raise unittest.SkipTest("面板服务未在超时内启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+
+    def setUp(self):
+        """每个用例前把那条 episode 重新拨回 6 天前：翻看/唤醒是有副作用的，不能串味。"""
+        m = Memory(self.tmp)
+        m.db.execute(
+            "UPDATE memories SET updated_at=?, last_used_at=0, use_count=0, wake_count=0,"
+            " last_wake_at=0, sleep_override='' WHERE kind='episode'",
+            (int(time.time() - 86400 * 6),))
+        m.db.commit()
+        m.close()
+
+    def get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path, headers={"Host": "127.0.0.1:%d" % self.port})
+        r = conn.getresponse()
+        body = json.loads(r.read().decode() or "{}")
+        conn.close()
+        return r.status, body
+
+    def post(self, path, payload):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        raw = json.dumps(payload).encode()
+        conn.request("POST", path, body=raw,
+                     headers={"Host": "127.0.0.1:%d" % self.port,
+                              "Content-Type": "application/json"})
+        r = conn.getresponse()
+        body = json.loads(r.read().decode() or "{}")
+        conn.close()
+        return r.status, body
+
+    def test_stats_reports_state_breakdown(self):
+        code, st = self.get("/api/stats")
+        self.assertEqual(code, 200)
+        self.assertIn("by_state", st)
+        self.assertEqual(sum(st["by_state"].values()), 2)
+        self.assertGreaterEqual(st["by_state"]["deep"] + st["by_state"]["dormant"], 1)
+
+    def test_sleepers_lists_the_sleeping_one(self):
+        code, d = self.get("/api/sleepers?limit=10")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(d["items"]), 1)
+        item = d["items"][0]
+        self.assertIn(item["state"], ("dormant", "deep"))
+        self.assertIn("since_touch_days", item)
+        self.assertIn("░░", item["preview"])          # 沉睡的正文是雾化的
+
+    def test_graph_nodes_carry_lifecycle_fields(self):
+        code, g = self.get("/api/graph")
+        self.assertEqual(code, 200)
+        self.assertIn("states", g["meta"])
+        self.assertIn("thresholds", g["meta"]["dormancy"])
+        node = g["nodes"][0]
+        for k in ("state", "state_label", "activation", "since_touch_days", "wake_count",
+                  "last_wake_at", "wake_weight", "sleep_override", "next_state_in_days"):
+            self.assertIn(k, node)
+
+    def test_wake_and_sleep_actions(self):
+        _, d = self.get("/api/sleepers?limit=10")
+        mid = d["items"][0]["id"]
+        code, r = self.post("/api/action", {"name": "wake", "id": mid})
+        self.assertEqual(code, 200)
+        self.assertEqual(r["result"]["state"], "awake")
+        self.assertGreater(r["result"]["wake_count"], 0)
+        code, r = self.post("/api/action", {"name": "sleep", "id": mid})
+        self.assertEqual(code, 200)
+        self.assertEqual(r["result"]["state"], "dormant")
+        self.assertEqual(r["result"]["sleep_override"], "dormant")
+        code, r = self.post("/api/action", {"name": "unsleep", "id": mid})
+        self.assertEqual(r["result"]["sleep_override"], "")
+
+    def test_detail_returns_full_body_and_wakes(self):
+        _, d = self.get("/api/sleepers?limit=10")
+        if not d["items"]:
+            self.skipTest("沉睡区已空")
+        mid = d["items"][0]["id"]
+        code, row = self.get("/api/memory/" + mid)
+        self.assertEqual(code, 200)
+        self.assertIn("原生桥", row["body"])          # 显式打开是明文
+        self.assertEqual(row["state"], "awake")       # 翻看即点亮
+        self.assertTrue(row["last_wake_at"] > 0)
+
+
+class PitfallApi(unittest.TestCase):
+    """雷区出口：面板「雷区」页签靠这两个端点，不能悄悄 404。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="memcore-pit-")
+        cls.env = dict(os.environ, MEM_HOME=cls.tmp)
+        run = lambda *a: subprocess.run([sys.executable, os.path.join(ROOT, "mem")] + list(a),
+                                        env=cls.env, check=True, capture_output=True)
+        run("learn", "--file", "memcore.py", "-t", "查询列集不一致", "--what", "两处分布打架",
+            "--fix", "统一列集常量")
+        run("learn", "--file", "ui/nebula.html", "-t", "面板数字回跳", "--what", "刷新拿到快照",
+            "--fix", "先请求接口再回落")
+        cls.port = _free_port()
+        cls.proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "mem"), "serve", "--port", str(cls.port)],
+            env=cls.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _wait(cls.port):
+            cls.proc.kill()
+            raise unittest.SkipTest("面板服务未在超时内启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+
+    def get(self, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", path, headers={"Host": "127.0.0.1:%d" % self.port})
+        r = conn.getresponse()
+        body = json.loads(r.read().decode() or "{}")
+        conn.close()
+        return r.status, body
+
+    def test_pitfalls_grouped_by_file(self):
+        code, d = self.get("/api/pitfalls")
+        self.assertEqual(code, 200)
+        self.assertEqual(d["total"], 2)
+        files = {f["file"]: f["count"] for f in d["files"]}
+        self.assertEqual(files.get("memcore.py"), 1)
+        self.assertIn("nebula.html", files)
+        item = d["items"][0]
+        for k in ("id", "title", "what", "fix", "file", "state_label"):
+            self.assertIn(k, item)
+        self.assertTrue(item["fix"])
+
+    def test_preflight_by_path(self):
+        code, d = self.get("/api/preflight?paths=memcore.py,server.py&limit=5")
+        self.assertEqual(code, 200)
+        self.assertTrue(d["items"])
+        self.assertEqual(d["items"][0]["file"], "memcore.py")
+        self.assertIn("修法", d["text"])
+
+    def test_preflight_unknown_path_is_empty_not_error(self):
+        code, d = self.get("/api/preflight?paths=no_such_module.py")
+        self.assertEqual(code, 200)
+        self.assertEqual(d["items"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

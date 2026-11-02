@@ -38,11 +38,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # constants / config
 # --------------------------------------------------------------------------
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DEFAULT_HOME = os.path.expanduser("~/.dsh/memory")
 VECTOR_DIM = 512
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DAY = 86400.0
 
 KIND_DEFAULTS = {
@@ -61,7 +61,7 @@ KIND_DEFAULTS = {
 KINDS = tuple(KIND_DEFAULTS)
 
 DEFAULT_CONFIG = {
-    "version": 5,
+    "version": 6,
     "weights": {          # validated on the real store (12/12 paraphrase queries)
         "lexical": 0.50,
         "semantic": 0.22,
@@ -83,6 +83,26 @@ DEFAULT_CONFIG = {
     "exclude": {"projects": [], "paths": [], "keywords": []},
     "llm": {"base": "http://127.0.0.1:8326/v1", "model": "deepseek-account/deepseek-flash",
             "gateway": True},
+    # 记忆的生命周期：激活度 → 清醒 / 模糊 / 沉睡 / 深度沉睡。
+    # 时间衰减是主项（按 kind 半衰期），显著度是"重要权重"，
+    # 唤醒权重给最近被想起的记忆加权，人工干预（pin / 让它沉睡）优先。
+    "dormancy": {
+        "enabled": True,
+        "thresholds": {"fuzzy": 0.45, "dormant": 0.26, "deep": 0.15},
+        "weights": {"recency": 0.52, "salience": 0.20, "reinforce": 0.12, "wake": 0.10},
+        "pinned_floor": 0.80,
+        # 每类记忆的"保质期"（天）：活多久才从清醒走到深度沉睡。
+        # 和检索排序用的 KIND_DEFAULTS 半衰期是两回事 —— 排序关心"相关性新鲜度"，
+        # 这里关心"这段记忆还活着吗"。会话片段本来就是快消品，所以只有一天半。
+        "life_days": {"identity": 3650.0, "preference": 720.0, "decision": 180.0,
+                      "project": 90.0, "fact": 120.0, "artifact": 10.0, "insight": 150.0,
+                      "todo": 14.0, "episode": 1.2, "note": 10.0},
+        "wake": {"halflife_hours": 72.0, "cooldown_minutes": 10},
+        "trigger": {"dormant": 0.30, "deep": 0.55},
+        "score": {"awake": 1.0, "fuzzy": 0.72, "dormant": 0.55, "deep": 0.40},
+        "fuzzy": {"keep_head": 0.35, "keep_tail": 0.12, "density": 0.55, "title_keep": 6},
+        "wake_on_search": True,
+    },
 }
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
@@ -109,6 +129,57 @@ def est_tokens(s: str) -> int:
     cjk = len(CJK_RE.findall(s))
     rest = max(0, len(s) - cjk)
     return int(math.ceil(cjk / 1.5 + rest / 3.6)) + 1
+
+
+# --------------------------------------------------------------------------
+# 记忆生命周期：清醒 / 模糊 / 沉睡 / 深度沉睡
+# --------------------------------------------------------------------------
+
+STATE_LABELS = {"awake": "清醒", "fuzzy": "模糊", "dormant": "沉睡", "deep": "深度沉睡"}
+# 踩过的坑用这个标签存，mem preflight 靠它把"雷区"捞出来
+PITFALL_TAG = "pitfall"
+STATE_ORDER = ("awake", "fuzzy", "dormant", "deep")
+
+
+def clamp01(x: Any) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+
+def mask_text(text: str, seed: str, keep_head: float = 0.35, keep_tail: float = 0.12,
+              density: float = 0.55) -> str:
+    """雾化一段文字：首尾保留，中段按稳定伪随机遮罩。
+
+    seed 决定花纹，所以同一条记忆每次看起来一样 —— 否则每刷新一次就换一副面孔，
+    读起来像噪声而不是"记不清"。首尾保留是因为人回忆时开头和结尾最清楚。
+    """
+    s = re.sub(r"\s+", " ", text or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 12:
+        return s[: max(2, len(s) - 2)] + "…"
+    h = int(hashlib.sha1((seed or "").encode("utf-8")).hexdigest()[:16], 16)
+    head = max(3, int(len(s) * float(keep_head)))
+    tail = max(2, int(len(s) * float(keep_tail)))
+    if head + tail >= len(s):
+        head, tail = max(2, len(s) // 2), 1
+    buf: List[str] = []
+    run = 0
+    for ch in s[head:len(s) - tail]:
+        h = (h * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+        if ((h >> 33) & 0xFFFF) / 65535.0 < float(density):
+            run += 1
+            if run <= 2:
+                buf.append("░")
+            elif run == 3:
+                buf.append("…")
+        else:
+            buf.append(ch)
+            run = 0
+    return (s[:head] + "".join(buf) + s[len(s) - tail:]).strip()
 
 
 def safe_base_url(base: str) -> bool:
@@ -282,7 +353,9 @@ CREATE TABLE IF NOT EXISTS memories (
   hash TEXT UNIQUE, meta TEXT NOT NULL DEFAULT '{}', seq INTEGER,
   sim INTEGER NOT NULL DEFAULT 0,
   valid_from INTEGER NOT NULL DEFAULT 0, valid_to INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'active'
+  status TEXT NOT NULL DEFAULT 'active',
+  wake_count INTEGER NOT NULL DEFAULT 0, last_wake_at INTEGER NOT NULL DEFAULT 0,
+  sleep_override TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_mem_kind ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_mem_project ON memories(project);
@@ -321,10 +394,15 @@ class Memory:
         cols = [r[1] for r in self.db.execute("PRAGMA table_info(memories)")]
         if "sim" not in cols:
             self.db.execute("ALTER TABLE memories ADD COLUMN sim INTEGER NOT NULL DEFAULT 0")
+        # 逐列重读：一次读到的 cols 不会包含刚 ADD 的列，多列迁移会互相遮蔽
         for col, ddl in (("valid_from", "INTEGER NOT NULL DEFAULT 0"),
                          ("valid_to", "INTEGER NOT NULL DEFAULT 0"),
-                         ("status", "TEXT NOT NULL DEFAULT 'active'")):
-            if col not in cols:
+                         ("status", "TEXT NOT NULL DEFAULT 'active'"),
+                         ("wake_count", "INTEGER NOT NULL DEFAULT 0"),
+                         ("last_wake_at", "INTEGER NOT NULL DEFAULT 0"),
+                         ("sleep_override", "TEXT NOT NULL DEFAULT ''")):
+            have = {r[1] for r in self.db.execute("PRAGMA table_info(memories)")}
+            if col not in have:
                 self.db.execute("ALTER TABLE memories ADD COLUMN %s %s" % (col, ddl))
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status)")
         self.db.commit()
@@ -574,6 +652,7 @@ class Memory:
         valid_to: int = 0,
         status: str = "active",
         autolink: Optional[bool] = None,
+        touch: bool = True,
     ) -> Dict[str, Any]:
         kind = kind if kind in KIND_DEFAULTS else "note"
         body = norm_text(body)
@@ -590,7 +669,9 @@ class Memory:
                 "SELECT id, use_count, body FROM memories "
                 "WHERE hash=? AND status='active' AND valid_to=0", (h,)).fetchone()
             if row:
-                self.reinforce(row["id"])
+                # touch=False 来自 ingest：灌库不等于"被想起"，否则记忆时钟永远不走
+                if touch:
+                    self.reinforce(row["id"])
                 return {"id": row["id"], "deduped": "exact", "body": row["body"]}
 
         if dedupe and kind == "artifact":
@@ -604,14 +685,16 @@ class Memory:
                 if row:
                     if len(body) > len(row["body"]):
                         self.update(row["id"], body=body)
-                    self.reinforce(row["id"])
+                    if touch:
+                        self.reinforce(row["id"])
                     return {"id": row["id"], "deduped": "path", "body": row["body"]}
 
         v = embed(title + "\n" + body, self.dim)
         if dedupe and self.cfg.get("dedupe_fuzzy", 0) > 0:
             dup = self._fuzzy_duplicate(kind, v, project)
             if dup:
-                self.reinforce(dup)
+                if touch:
+                    self.reinforce(dup)
                 return {"id": dup, "deduped": "fuzzy"}
 
         mid = self._next_id()
@@ -646,7 +729,8 @@ class Memory:
         row = self.get(mid)
         if not row:
             return False
-        allowed = {"title", "body", "kind", "project", "salience", "confidence", "pinned", "ttl_days", "tags"}
+        allowed = {"title", "body", "kind", "project", "salience", "confidence", "pinned",
+                   "ttl_days", "tags", "meta"}
         sets, vals = [], []
         for k, v in fields.items():
             if k not in allowed or v is None:
@@ -655,6 +739,23 @@ class Memory:
                 v = norm_text(v)
             if k == "pinned":
                 v = 1 if v else 0
+            if k == "meta":
+                # dict 走合并而不是覆盖：triggers 之外还有 done/prio/retire_reason 这些键
+                cur = {}
+                try:
+                    cur = json.loads(row.get("meta") or "{}")
+                except (TypeError, ValueError):
+                    cur = {}
+                if not isinstance(cur, dict):
+                    cur = {}
+                if isinstance(v, dict):
+                    cur.update(v)
+                else:
+                    try:
+                        cur.update(json.loads(v) or {})
+                    except (TypeError, ValueError):
+                        continue
+                v = json.dumps(cur, ensure_ascii=False)
             if k == "tags":
                 # 标签写 tags 表，同时把 memories.tags 同步成逗号串；
                 # 直接把 list 绑进 TEXT 列会抛 InterfaceError（标签因此永远改不动）
@@ -832,11 +933,374 @@ class Memory:
         d["retired"] = self.db.execute(
             "SELECT count(*) c FROM memories WHERE status!='active'").fetchone()["c"]
         d["pinned"] = self.db.execute("SELECT count(*) c FROM memories WHERE pinned=1").fetchone()["c"]
+        d["by_state"] = self.state_counts()
         d["links"] = self.db.execute("SELECT count(*) c FROM links").fetchone()["c"]
         d["db_bytes"] = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
         row = self.db.execute("SELECT max(updated_at) m FROM memories").fetchone()
         d["last_write"] = row["m"] if row and row["m"] else None
         return d
+
+    # -- lifecycle: 清醒 / 模糊 / 沉睡 / 深度沉睡 ---------------------------
+    def _dorm(self) -> Dict[str, Any]:
+        d = self.cfg.get("dormancy")
+        return d if isinstance(d, dict) else json.loads(json.dumps(DEFAULT_CONFIG["dormancy"]))
+
+    def _dorm_thresholds(self) -> Tuple[float, float, float]:
+        th = (self._dorm().get("thresholds") or {})
+        return (float(th.get("fuzzy", 0.45)), float(th.get("dormant", 0.26)),
+                float(th.get("deep", 0.12)))
+
+    def _life_days(self, kind: str) -> float:
+        """这类记忆的保质期（天）。配置缺失时退回检索用的半衰期。"""
+        lives = self._dorm().get("life_days") or {}
+        try:
+            return max(0.01, float(lives.get(kind)))
+        except (TypeError, ValueError):
+            return float(KIND_DEFAULTS.get(kind, (0.5, 180.0))[1])
+
+    def _recency_anchor(self, row: Dict[str, Any]) -> int:
+        """最近一次"被想起"的时间：写入、被召回、或主动唤醒。
+
+        召回也会算数 —— 用得着的记忆才活得久，没人碰的自然凉下去。
+        """
+        anchor = max(int(row.get("updated_at") or 0), int(row.get("last_wake_at") or 0),
+                     int(row.get("last_used_at") or 0))
+        # created_at 只作兜底：拿它当锚点，老记忆永远"刚出生"，年龄白算
+        return anchor or int(row.get("created_at") or 0)
+
+    def wake_weight(self, row: Dict[str, Any], t: Optional[int] = None) -> float:
+        """唤醒权重：距上次唤醒按半衰期衰减，唤醒次数越多底子越厚。"""
+        d = (self._dorm().get("wake") or {})
+        wc = int(row.get("wake_count") or 0)
+        lw = int(row.get("last_wake_at") or 0)
+        if wc <= 0 or lw <= 0:
+            return 0.0
+        t = int(t or now())
+        hl = max(0.5, float(d.get("halflife_hours", 72.0)))
+        hours = max(0.0, (t - lw) / 3600.0)
+        decay = 0.5 ** (hours / hl)
+        return round(clamp01(decay * min(1.0, 0.8 + 0.07 * (wc - 1))), 4)
+
+    def activation(self, row: Dict[str, Any], t: Optional[int] = None) -> float:
+        """激活度：时间衰减（按 kind 半衰期）+ 显著度 + 复用 + 唤醒权重。
+
+        pinned / 人工干预在这之后覆盖 —— 人按下的钉子比公式优先。
+        """
+        d = self._dorm()
+        if not d.get("enabled", True):
+            return 1.0
+        t = int(t or now())
+        w = d.get("weights") or {}
+        kind = row.get("kind") or "note"
+        halflife = self._life_days(kind)
+        age_days = max(0.0, (t - self._recency_anchor(row)) / DAY)
+        rec = 0.5 ** (age_days / halflife) if halflife > 0 else 0.0
+        sal = clamp01(row.get("salience")) if row.get("salience") is not None else 0.5
+        uses = max(0, int(row.get("use_count") or 0))
+        reinf = min(1.0, math.log1p(uses) / math.log1p(25))
+        act = (float(w.get("recency", 0.52)) * rec
+               + float(w.get("salience", 0.20)) * sal
+               + float(w.get("reinforce", 0.12)) * reinf
+               + float(w.get("wake", 0.10)) * self.wake_weight(row, t))
+        act = clamp01(act)
+        fz, dm, _dp = self._dorm_thresholds()
+        if int(row.get("pinned") or 0):
+            act = max(act, clamp01(d.get("pinned_floor", 0.80)))
+        ov = str(row.get("sleep_override") or "")
+        if ov == "awake":
+            act = max(act, min(1.0, fz + 0.05))
+        elif ov == "dormant":
+            act = min(act, max(0.0, dm - 0.02))
+        return round(act, 4)
+
+    def _next_state_in_days(self, row: Dict[str, Any], act: float,
+                            t: Optional[int] = None) -> Optional[float]:
+        """按纯时间衰减推算：还要几天掉到下一档。None = 已经到底 / 被钉住。"""
+        d = self._dorm()
+        if int(row.get("pinned") or 0) and not row.get("sleep_override"):
+            return None
+        fz, dm, dp = self._dorm_thresholds()
+        target = fz if act >= fz else dm if act >= dm else dp if act >= dp else None
+        if target is None:
+            return None
+        w = d.get("weights") or {}
+        wr = float(w.get("recency", 0.52))
+        if wr <= 0:
+            return None
+        kind = row.get("kind") or "note"
+        halflife = self._life_days(kind)
+        if halflife <= 0:
+            return None
+        t = int(t or now())
+        sal = clamp01(row.get("salience")) if row.get("salience") is not None else 0.5
+        uses = max(0, int(row.get("use_count") or 0))
+        reinf = min(1.0, math.log1p(uses) / math.log1p(25))
+        rest = (float(w.get("salience", 0.20)) * sal
+                + float(w.get("reinforce", 0.12)) * reinf
+                + float(w.get("wake", 0.10)) * self.wake_weight(row, t))
+        need = (target - rest) / wr
+        if need <= 0.0:
+            return 0.0
+        if need >= 1.0:
+            return None
+        age_days = max(0.0, (t - self._recency_anchor(row)) / DAY)
+        return round(max(0.0, halflife * math.log2(1.0 / need) - age_days), 1)
+
+    def memory_state(self, row: Dict[str, Any], t: Optional[int] = None) -> Dict[str, Any]:
+        """一条记忆此刻的生命体征。UI 面板吃的就是这份结构。"""
+        t = int(t or now())
+        act = self.activation(row, t)
+        fz, dm, dp = self._dorm_thresholds()
+        state = ("awake" if act >= fz else "fuzzy" if act >= dm
+                 else "dormant" if act >= dp else "deep")
+        kind = row.get("kind") or "note"
+        halflife = self._life_days(kind)
+        touched_days = max(0.0, (t - self._recency_anchor(row)) / DAY)
+        created = int(row.get("created_at") or self._recency_anchor(row))
+        return {
+            "state": state,
+            "state_label": STATE_LABELS[state],
+            "activation": act,
+            # age_days = 这段记忆存在多久了；since_touch_days = 多久没被想起
+            "age_days": round(max(0.0, (t - created) / DAY), 2),
+            "since_touch_days": round(touched_days, 2),
+            "halflife_days": halflife,
+            "wake_count": int(row.get("wake_count") or 0),
+            "last_wake_at": int(row.get("last_wake_at") or 0),
+            "wake_weight": self.wake_weight(row, t),
+            "sleep_override": str(row.get("sleep_override") or ""),
+            "next_state_in_days": self._next_state_in_days(row, act, t),
+        }
+
+    @staticmethod
+    def memory_triggers(row: Dict[str, Any]) -> List[str]:
+        """显式触发词：写在 meta.triggers 里，命中即唤醒（不受弱线索门槛限制）。"""
+        raw = row.get("meta")
+        if not raw:
+            return []
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(meta, dict):
+            return []
+        out = []
+        for t in (meta.get("triggers") or []):
+            t = str(t).strip().lower()
+            if t and t not in out:
+                out.append(t)
+        return out[:12]
+
+    def sleep_scale(self, state: str) -> float:
+        """模糊/沉睡的记忆仍能被召回，但分数要打折 —— 这就是"想不全"。"""
+        return float((self._dorm().get("score") or {}).get(state, 1.0))
+
+    def mask_body(self, row: Dict[str, Any], state: str) -> Tuple[str, str]:
+        """返回 (标题, 正文) 的可见版本。清醒态原样返回。"""
+        title = row.get("title") or ""
+        body = row.get("body") or ""
+        if state == "awake" or not self._dorm().get("enabled", True):
+            return title, body
+        fz = self._dorm().get("fuzzy") or {}
+        density = {"fuzzy": float(fz.get("density", 0.55)),
+                   "dormant": 0.75, "deep": 0.90}.get(state, 0.55)
+        keep = int(fz.get("title_keep", 6))
+        t_out = title if len(title) <= keep else title[:keep] + "…"
+        b_out = mask_text(body, str(row.get("id") or ""), float(fz.get("keep_head", 0.35)),
+                          float(fz.get("keep_tail", 0.12)), density)
+        return t_out, b_out
+
+    def wake(self, mid: str, reason: str = "manual") -> Optional[Dict[str, Any]]:
+        """唤醒：唤醒次数与唤醒权重上去，激活度里的"新鲜度"重新计时。"""
+        row = self.get(mid)
+        if not row:
+            return None
+        if reason == "trigger":
+            cd = float((self._dorm().get("wake") or {}).get("cooldown_minutes", 10)) * 60.0
+            lw = int(row.get("last_wake_at") or 0)
+            if cd > 0 and lw and now() - lw < cd:
+                return None            # 冷却中：一次线索不该连点唤醒同一段记忆
+        t = now()
+        with self.db:
+            if reason == "manual":
+                # 人手点"唤醒"= 明确撤销之前按下的"让它沉睡"；线索唤醒不动人工干预
+                self.db.execute(
+                    "UPDATE memories SET wake_count=wake_count+1, last_wake_at=?, sleep_override='' "
+                    "WHERE id=?", (t, mid))
+            else:
+                self.db.execute(
+                    "UPDATE memories SET wake_count=wake_count+1, last_wake_at=? WHERE id=?", (t, mid))
+        self._journal("wake", mid, {"reason": reason})
+        return self.memory_state(self.get(mid) or row, t)
+
+    def sleep(self, mid: str, reason: str = "manual") -> Optional[Dict[str, Any]]:
+        """让它沉睡：人工把激活度压到沉睡档，但内容不删，强线索仍可唤回。"""
+        row = self.get(mid)
+        if not row:
+            return None
+        with self.db:
+            self.db.execute("UPDATE memories SET sleep_override='dormant' WHERE id=?", (mid,))
+        self._journal("sleep", mid, {"reason": reason})
+        return self.memory_state(self.get(mid) or row)
+
+    def unsleep(self, mid: str, reason: str = "manual") -> Optional[Dict[str, Any]]:
+        """撤销人工干预，交还给时间与权重。"""
+        row = self.get(mid)
+        if not row:
+            return None
+        with self.db:
+            self.db.execute("UPDATE memories SET sleep_override='' WHERE id=?", (mid,))
+        self._journal("unsleep", mid, {"reason": reason})
+        return self.memory_state(self.get(mid) or row)
+
+    # 生命周期只认这几列。少一列（尤其 last_used_at）会让同一份库在
+    # state_counts / graph_export / sleepers 之间算出三套不同的分布来。
+    LIFE_COLS = ("id, kind, title, body, tags, project, salience, pinned, use_count, "
+                 "created_at, updated_at, last_used_at, last_wake_at, wake_count, "
+                 "sleep_override, meta")
+
+    def state_counts(self, t: Optional[int] = None) -> Dict[str, int]:
+        t = int(t or now())
+        out = {k: 0 for k in STATE_ORDER}
+        for r in self.db.execute(
+                "SELECT %s FROM memories WHERE status='active' AND valid_to=0" % self.LIFE_COLS):
+            out[self.memory_state(dict(r), t)["state"]] += 1
+        return out
+
+    def sleepers(self, limit: int = 60, t: Optional[int] = None) -> List[Dict[str, Any]]:
+        """沉睡区：越接近遗忘的排前面。"""
+        t = int(t or now())
+        rows: List[Dict[str, Any]] = []
+        for r in self.db.execute(
+                "SELECT * FROM memories WHERE status='active' AND valid_to=0"):
+            row = dict(r)
+            st = self.memory_state(row, t)
+            if st["state"] not in ("dormant", "deep"):
+                continue
+            _tt, b_out = self.mask_body(row, st["state"])
+            rows.append({
+                "id": row["id"], "title": row["title"], "kind": row["kind"],
+                "project": row["project"], "tags": [x for x in (row["tags"] or "").split(",") if x],
+                "preview": b_out[:180], "state": st["state"],
+                "state_label": st["state_label"], "activation": st["activation"],
+                "age_days": st["age_days"], "since_touch_days": st["since_touch_days"],
+                "wake_count": st["wake_count"],
+                "last_wake_at": st["last_wake_at"], "wake_weight": st["wake_weight"],
+                "next_state_in_days": st["next_state_in_days"],
+                "sleep_override": st["sleep_override"], "created_at": int(row["created_at"]),
+                "triggers": self.memory_triggers(row),
+            })
+        rows.sort(key=lambda x: (x["activation"], x["created_at"]))
+        return rows[: max(1, int(limit))]
+
+    # -- preflight: 动手前的雷区清单 ---------------------------------------
+    @staticmethod
+    def _path_keys(paths: Sequence[str]) -> List[str]:
+        """把文件路径压成可用于 tag 匹配的键：文件名、去扩展名、父目录名。"""
+        out: List[str] = []
+        for p in paths or ():
+            p = str(p or "").strip()
+            if not p:
+                continue
+            base = os.path.basename(p.rstrip("/\\"))
+            if not base:
+                continue
+            out.append(base.lower())
+            stem = os.path.splitext(base)[0].lower()
+            if stem and stem != base.lower():
+                out.append(stem)
+            # 只取调用者自己写的目录前缀（ui/nebula.html → ui）；
+            # 用 abspath 会把仓库根目录名（memory-core）当键，一查就命中全库的坑
+            rel_dir = os.path.dirname(p.rstrip("/"))
+            parent = os.path.basename(rel_dir.rstrip("/")) if rel_dir else ""
+            if parent:
+                out.append(parent.lower())
+        return list(dict.fromkeys([k for k in out if k]))
+
+    def preflight(self, paths: Sequence[str] = (), topic: str = "",
+                  limit: int = 10, budget_tokens: int = 900) -> Dict[str, Any]:
+        """开工前查一次：这块代码/这个主题以前踩过什么坑，结论是什么。
+
+        记忆不会自己浮出来 —— 检索总得有人按开关。这条命令就是开关：
+        tag 精确命中优先（坑是按文件名存的），语义检索兜底。
+        """
+        t = now()
+        keys = self._path_keys(paths)
+        scored: Dict[str, float] = {}
+
+        def bump(mid: str, amount: float) -> None:
+            scored[mid] = scored.get(mid, 0.0) + amount
+
+        # 1) 按文件名/目录名的 tag 精确命中
+        for k in keys:
+            for r in self.db.execute("SELECT memory_id FROM tags WHERE tag=?", (k,)):
+                bump(r["memory_id"], 1.0)
+        # 2) 没给文件名（只给了主题）时，所有雷区都摊开；
+        #    给了文件名就只认命中的 —— 查 X 文件不该被别的模块的坑淹掉
+        if not keys:
+            for r in self.db.execute("SELECT memory_id FROM tags WHERE tag=?", (PITFALL_TAG,)):
+                bump(r["memory_id"], 0.35)
+        # 3) 语义/词法兜底：主题词 + 文件名本身
+        q = " ".join([topic or ""] + keys).strip()
+        if q:
+            for h in self.search(q, limit=max(6, limit), min_score=0.0)[:10]:
+                if h.get("state") != "awake":
+                    continue
+                bump(h["id"], 0.45 * min(1.0, float(h.get("score") or 0) / 1.2))
+        # 4) pinned 偏好永远值得看
+        for r in self.db.execute(
+                "SELECT id FROM memories WHERE pinned=1 AND status='active' AND kind='preference'"):
+            bump(r["id"], 0.12)
+
+        if not scored:
+            return {"text": "# 动手前检查 · %s\n(没有相关记录；这次踩的坑请用 mem learn 写回来)"
+                            % ("、".join(keys[:6]) or topic or "-"),
+                    "items": [], "keys": keys}
+
+        rows = {}
+        for mid in scored:
+            row = self.get(mid)
+            if not row or row.get("status") != "active":
+                continue
+            rows[mid] = row
+
+        def rank(mid: str) -> float:
+            r = rows[mid]
+            age = max(0.0, (t - int(r["updated_at"])) / DAY)
+            rec = 0.5 ** (age / 180.0)
+            return scored[mid] + 0.25 * rec + 0.15 * clamp01(r.get("salience"))
+
+        # 坑优先铺满；非坑的只留最相关 3 条，否则一次检查就变成"再来十篇背景资料"
+        ordered_all = sorted(rows, key=rank, reverse=True)
+        pits = [x for x in ordered_all if PITFALL_TAG in set(
+            y for y in (rows[x].get("tags") or "").split(",") if y)]
+        rest = [x for x in ordered_all if x not in set(pits)][:3]
+        ordered = (pits + rest)[: max(1, int(limit))]
+        items, lines, used = [], [], 0
+        label = "、".join(keys[:6]) + (" 等 %d 个" % len(keys) if len(keys) > 6 else "")
+        head = "# 动手前检查 · %s" % (label or topic or "-")
+        for mid in ordered:
+            r = rows[mid]
+            tags = set(x for x in (r.get("tags") or "").split(",") if x)
+            is_pit = PITFALL_TAG in tags
+            mark = "⚠" if is_pit else ("★" if r.get("pinned") else "·")
+            body = re.sub(r"\s+", " ", r.get("body") or "")
+            line = "%s [%s] %s — %s" % (mark, mid, r.get("title") or "", body[:220])
+            if used + est_tokens(line) > budget_tokens and items:
+                break
+            lines.append(line)
+            used += est_tokens(line)
+            keys_of = [x for x in tags if x != PITFALL_TAG]
+            primary = next((k for k in keys_of if "." in k or "/" in k),
+                           keys_of[0] if keys_of else "")
+            items.append({"id": mid, "title": r.get("title"), "kind": r.get("kind"),
+                          "pitfall": is_pit, "score": round(rank(mid), 3),
+                          "file": primary, "files": sorted(keys_of), "tags": sorted(tags)})
+        pit_n = sum(1 for i in items if i["pitfall"])
+        text = "\n".join([head + " · %d 条（坑 %d）" % (len(items), pit_n)] + lines)
+        if pit_n:
+            text += "\n> 命中的坑按上面写的修法做，不要重新发明一遍。"
+        return {"text": text, "items": items, "keys": keys, "tokens": used}
 
     # -- retrieval --------------------------------------------------------
     def _select_candidates(self, query: str, project: str = "", kinds: Sequence[str] = (),
@@ -973,7 +1437,7 @@ class Memory:
                         continue
                 elif r["valid_to"] or r["status"] != "active":
                     continue
-                rows[r["id"]] = r
+                rows[r["id"]] = dict(r)      # 生命周期逻辑用 dict 访问（.get），Row 不支持
         qv = vec_of(embed(q, self.dim), self.dim)
         rows_vec = {mid: vec_of(r["v"], self.dim) for mid, r in rows.items()}
         sem = {mid: cosine(qv, rows_vec[mid]) for mid in rows}
@@ -987,10 +1451,16 @@ class Memory:
 
         intent_file = bool(re.search(r"(文件|文档|路径|目录|哪份|哪篇|file|doc|path|directory)", q, re.I))
         t = now()
+        dorm = self._dorm()
+        dorm_on = bool(dorm.get("enabled", True))
+        trig_cfg = dorm.get("trigger") or {}
+        wake_on_search = bool(dorm.get("wake_on_search", True))
+        ql = (q or "").lower()
         out = []
         for mid, r in rows.items():
             halflife = KIND_DEFAULTS.get(r["kind"], (0.5, 180.0))[1]
-            age_days = max(0.0, (t - int(r["updated_at"])) / DAY)
+            anchor = self._recency_anchor(r)
+            age_days = max(0.0, (t - anchor) / DAY)
             rec = 0.5 ** (age_days / halflife)
             reinf = min(1.0, math.log1p(int(r["use_count"])) / math.log1p(25))
             s = (w["lexical"] * lexn.get(mid, 0.0)
@@ -1007,23 +1477,68 @@ class Memory:
                 s += 0.06
             if intent_file and r["kind"] in ("artifact", "project"):
                 s += 0.10
+            tl = (r["title"] or "").lower()
+            bl = (r["body"] or "").lower()
+            # 正文里精确出现算 0.50：够叫醒"沉睡"，不够叫醒"深度沉睡"（0.55 门槛）
+            contain = 0.80 if (ql and ql in tl) else 0.50 if (ql and ql in bl) else 0.0
+            # 显式触发词：这条记忆自己声明的"想起它的暗号"
+            cues = [c for c in self.memory_triggers(r) if c and c in ql]
             evidence = (lexn.get(mid, 0.0) > 0.0 or sem.get(mid, 0.0) >= 0.12
                         or cand[mid].get("title")
                         or ovl.get(mid, 0.0) >= 0.22
                         or tovl.get(mid, 0.0) >= 0.20
-                        or cand[mid].get("tag") or cand[mid].get("ent"))
+                        or cand[mid].get("tag") or cand[mid].get("ent")
+                        or contain > 0.0            # 精确短语命中：归一化后可能为 0，但它是硬证据
+                        or bool(cues))              # 触发词命中：本来就是"这条记忆的钥匙"
             if not evidence:
                 continue
-            if s >= min_score:
-                out.append({
-                    "id": mid, "kind": r["kind"], "title": r["title"], "body": r["body"],
-                    "project": r["project"], "tags": [x for x in (r["tags"] or "").split(",") if x],
-                    "score": round(s, 4), "semantic": round(sem.get(mid, 0.0), 3),
-                    "lexical": round(lexn.get(mid, 0.0), 3), "recency": round(rec, 3),
-                    "salience": float(r["salience"]), "pinned": bool(r["pinned"]),
-                    "use_count": int(r["use_count"]), "created_at": int(r["created_at"]),
-                    "updated_at": int(r["updated_at"]), "_sim": int(r["sim"] or 0),
-                })
+
+            # ---- 生命周期：沉睡的记忆不是不存在，是"线索不够就叫不醒" ----
+            st = self.memory_state(r, t) if dorm_on else {
+                "state": "awake", "state_label": STATE_LABELS["awake"], "activation": 1.0,
+                "age_days": round(age_days, 2), "since_touch_days": round(age_days, 2),
+                "halflife_days": halflife, "wake_count": 0,
+                "last_wake_at": 0, "wake_weight": 0.0, "sleep_override": "",
+                "next_state_in_days": None}
+            state = st["state"]
+            exact = bool(cand[mid].get("tag") or cand[mid].get("ent") or cues)
+            # 触发强度只看绝对量：批量归一化过的 lexn 会让"只有一条结果的短查询"
+            # 显得极端匹配，一句话就把整库叫醒。
+            trigger = max(0.60 * ovl.get(mid, 0.0) + 0.40 * max(0.0, sem.get(mid, 0.0)), contain)
+            if cues:
+                trigger = max(trigger, 0.95)
+            if exact:
+                trigger += 0.20
+            trigger = round(clamp01(trigger), 4)
+            if not exact:
+                if state == "dormant" and trigger < float(trig_cfg.get("dormant", 0.30)):
+                    continue
+                if state == "deep" and trigger < float(trig_cfg.get("deep", 0.55)):
+                    continue
+            s *= self.sleep_scale(state)
+            if s < min_score:
+                continue
+            woke = False
+            if state in ("dormant", "deep") and wake_on_search:
+                if self.wake(mid, "trigger") is not None:
+                    woke = True
+                    st = self.memory_state(self.get(mid) or r, now())
+                    state = st["state"]
+            title_out, body_out = self.mask_body(r, state)
+            out.append({
+                "id": mid, "kind": r["kind"], "title": title_out, "body": body_out,
+                "project": r["project"], "tags": [x for x in (r["tags"] or "").split(",") if x],
+                "score": round(s, 4), "semantic": round(sem.get(mid, 0.0), 3),
+                "lexical": round(lexn.get(mid, 0.0), 3), "recency": round(rec, 3),
+                "salience": float(r["salience"]), "pinned": bool(r["pinned"]),
+                "use_count": int(r["use_count"]), "created_at": int(r["created_at"]),
+                "updated_at": int(r["updated_at"]), "_sim": int(r["sim"] or 0),
+                "state": state, "state_label": st["state_label"],
+                "activation": st["activation"], "trigger": trigger, "woke": woke,
+                "age_days": st["age_days"], "wake_count": st["wake_count"],
+                "last_wake_at": st["last_wake_at"], "sleep_override": st["sleep_override"],
+                "triggers": self.memory_triggers(r),
+            })
         out.sort(key=lambda x: x["score"], reverse=True)
         # MMR diversification on 64-bit simhash (hamming ~ cosine, ~50x cheaper)
         sel: List[Dict[str, Any]] = []
@@ -1050,7 +1565,7 @@ class Memory:
                kinds: Sequence[str] = (), compact: bool = False,
                as_of: Optional[int] = None) -> Dict[str, Any]:
         hits = self.search(query, limit=24, project=project, kinds=kinds, as_of=as_of)
-        items, used = [], 0
+        items, used, woke = [], 0, []
         for h in hits:
             line = self._format_hit(h, compact=compact)
             cost = est_tokens(line)
@@ -1064,25 +1579,92 @@ class Memory:
                         continue
                     line = line[: max(20, remaining)]
                     cost = est_tokens(line)
-            items.append({"id": h["id"], "line": line, "score": h["score"]})
+            items.append({"id": h["id"], "line": line, "score": h["score"],
+                          "state": h.get("state", "awake"), "woke": bool(h.get("woke"))})
             used += cost
+            if h.get("woke"):
+                woke.append(h["id"])
             self.reinforce(h["id"], 0.01)
         header = "# 记忆召回 · %s · %d 条 · ~%d tok" % (query[:60], len(items), used)
+        if woke:
+            header += " · 线索唤醒 %d 条" % len(woke)
         text = "\n".join([header] + [i["line"] for i in items])
         if not items:
             text = header + "\n(无匹配；可放宽 --budget / 去掉过滤，或先 mem add 写入事实)"
+        if woke:
+            text += "\n> 本次由线索唤醒（已迁回清醒）：%s；想主动叫醒：mem wake <ID>" % "、".join(woke[:8])
         text += "\n> 展开：mem get <ID>；补充：mem add -k fact -t 标题 -b 正文 --tags a,b"
-        return {"text": text, "items": items, "tokens": used, "hits": len(hits)}
+        return {"text": text, "items": items, "tokens": used, "hits": len(hits), "woken": woke}
 
     @staticmethod
     def _format_hit(h: Dict[str, Any], compact: bool = False, max_chars: Optional[int] = None) -> str:
         day = time.strftime("%Y-%m-%d", time.localtime(h["created_at"]))
-        body = re.sub(r"\s+", " ", h["body"])
+        body = re.sub(r"\s+", " ", h.get("body") or "")
         cap = int(max_chars) if max_chars else (110 if compact else 240)
         body = body[:cap] + ("…" if len(body) > cap else "")
-        star = "★" if h["pinned"] else ""
-        return "[%s] %s%s %s %s (%.2f) — %s — %s" % (
-            h["id"], star, h["kind"], h["project"] or "-", day, h["score"], h["title"], body)
+        star = "★" if h.get("pinned") else ""
+        state = h.get("state") or "awake"
+        mark = ""
+        if state != "awake":
+            mark = "〔%s%s〕" % (STATE_LABELS.get(state, state), "·已唤醒" if h.get("woke") else "")
+        return "[%s]%s %s%s %s %s (%.2f) — %s — %s" % (
+            h["id"], mark, star, h["kind"], h["project"] or "-", day, h["score"],
+            h.get("title") or "", body)
+
+    def _split_pitfall_body(self, body: str) -> Tuple[str, str]:
+        """把"现象：…\n修法：…"拆成两段，面板和 CLI 都要单独显示。"""
+        what = fix = ""
+        m = re.search(r"现象[：:]\s*(.+)", body or "")
+        if m:
+            what = m.group(1).strip()
+        m = re.search(r"修法[：:]\s*(.+)", body or "")
+        if m:
+            fix = m.group(1).strip()
+        return what, fix
+
+    def pitfalls(self, file: str = "", limit: int = 200) -> Dict[str, Any]:
+        """雷区总表：所有 pitfall 条目，按文件归组。面板的「雷区」页签吃这份。"""
+        t = now()
+        rows: List[Dict[str, Any]] = []
+        for r in self.db.execute(
+                "SELECT m.* FROM memories m JOIN tags t ON t.memory_id=m.id "
+                "WHERE t.tag=? AND m.status='active' ORDER BY m.updated_at DESC",
+                (PITFALL_TAG,)):
+            row = dict(r)
+            keys = [x for x in (row.get("tags") or "").split(",") if x and x != PITFALL_TAG]
+            # 主归属：第一个像路径的键（带 . 或 /），没有就取第一个
+            primary = next((k for k in keys if "." in k or "/" in k), keys[0] if keys else "")
+            if file and file.lower() not in [k.lower() for k in keys]:
+                continue
+            st = self.memory_state(row, t)
+            what, fix = self._split_pitfall_body(row.get("body") or "")
+            rows.append({
+                "id": row["id"], "title": row["title"], "kind": row["kind"],
+                "file": primary, "files": keys, "what": what, "fix": fix,
+                "project": row["project"], "updated_at": int(row["updated_at"]),
+                "created_at": int(row["created_at"]), "salience": round(float(row["salience"]), 3),
+                "state": st["state"], "state_label": st["state_label"],
+                "activation": st["activation"],
+            })
+        groups: Dict[str, int] = {}
+        for r in rows:
+            if r["file"]:
+                groups[r["file"]] = groups.get(r["file"], 0) + 1
+        files = sorted(({"file": k, "count": n} for k, n in groups.items()),
+                       key=lambda x: (-x["count"], x["file"]))
+        return {"total": len(rows), "items": rows[: max(1, int(limit))], "files": files,
+                "generated": t}
+
+    def preflight_payload(self, paths: Sequence[str] = (), topic: str = "",
+                          limit: int = 10) -> Dict[str, Any]:
+        """给 HTTP 用的 preflight：文本 + 结构化条目。"""
+        r = self.preflight(paths, topic=topic, limit=limit)
+        out = []
+        for i in r.get("items") or []:
+            row = self.get(i["id"]) or {}
+            what, fix = self._split_pitfall_body(row.get("body") or "")
+            out.append(dict(i, what=what, fix=fix))
+        return {"text": r.get("text", ""), "items": out, "keys": r.get("keys", [])}
 
     # -- brief ------------------------------------------------------------
     def brief(self, budget_tokens: int = 800, project: str = "") -> str:
@@ -1130,13 +1712,28 @@ class Memory:
         st = self.stats()
         lines.append("> %d 条记忆 · %d 项目 · 扩展：mem recall \"<query>\" --budget 1200｜mem get <ID>"
                      % (st["total"], len([k for k in st["by_project"] if k != "(none)"])))
+        pit = self.db.execute(
+            "SELECT count(*) c FROM tags t JOIN memories m ON m.id=t.memory_id "
+            "WHERE t.tag=? AND m.status='active'", (PITFALL_TAG,)).fetchone()["c"]
+        if pit:
+            lines.append("> 已知雷区 %d 条：动手前先 `mem preflight <文件名>`，命中的按修法做" % pit)
+        by = st.get("by_state") or {}
+        if by:
+            lines.append("> 状态：清醒 %d · 模糊 %d · 沉睡 %d · 深度沉睡 %d（沉睡区可用 mem states 查，"
+                         "mem wake <ID> 叫醒）"
+                         % (by.get("awake", 0), by.get("fuzzy", 0),
+                            by.get("dormant", 0), by.get("deep", 0)))
         return "\n".join(lines)
 
-    @staticmethod
-    def _row_to_hit(r: Dict[str, Any]) -> Dict[str, Any]:
-        return {"id": r["id"], "kind": r["kind"], "title": r["title"], "body": r["body"],
+    def _row_to_hit(self, r: Dict[str, Any]) -> Dict[str, Any]:
+        """把一行记忆做成召回用的 hit；模糊/沉睡态下标题与正文已经是雾化版本。"""
+        st = self.memory_state(r)
+        title, body = self.mask_body(r, st["state"])
+        return {"id": r["id"], "kind": r["kind"], "title": title, "body": body,
                 "project": r["project"], "score": float(r.get("salience", 0.5)),
-                "pinned": bool(r.get("pinned", 0)), "created_at": int(r["created_at"])}
+                "pinned": bool(r.get("pinned", 0)), "created_at": int(r["created_at"]),
+                "state": st["state"], "state_label": st["state_label"],
+                "activation": st["activation"], "woke": False}
 
     # -- graph / timeline -------------------------------------------------
     def graph(self, mid: str, depth: int = 1) -> Dict[str, Any]:
@@ -1190,8 +1787,12 @@ class Memory:
             "SELECT id, ttl_days, created_at FROM memories WHERE ttl_days>0 AND pinned=0")]
         dead = [r["id"] for r in expired if r["created_at"] + r["ttl_days"] * DAY < t]
         cold = [dict(r) for r in self.db.execute(
-            "SELECT id FROM memories WHERE kind='episode' AND use_count=0 AND created_at<?", (t - 120 * DAY,))]
-        dead += [r["id"] for r in cold]
+            "SELECT id FROM memories WHERE kind='episode' AND use_count=0 AND wake_count=0"
+            " AND created_at<?", (t - 120 * DAY,))]
+        # 有边的片段即使很旧也是网络的一部分，不能按"冷"清掉
+        linked = {r["id"] for r in self.db.execute(
+            "SELECT src AS id FROM links UNION SELECT dst AS id FROM links")}
+        dead += [r["id"] for r in cold if r["id"] not in linked]
         dead = sorted(set(dead))
         if not dry_run:
             for mid in dead:
@@ -1376,7 +1977,8 @@ class Memory:
             ttl = utext.replace("\n", " ").strip()
             r = self.add(body, title=ttl[:44], kind="episode", project=proj,
                          source="session", source_ref=sid, ts=utime,
-                         tags=["session", proj] if proj else ["session"], salience=0.4)
+                         tags=["session", proj] if proj else ["session"], salience=0.4,
+                         touch=False)
             if not r.get("deduped"):
                 added += 1
             pending = None
@@ -1425,7 +2027,7 @@ class Memory:
             r = self.add(summary, title="会话回顾：" + (title or (intents[0] if intents else sid))[:50],
                          kind="note", project=proj, source="session", source_ref=sid,
                          tags=["session-summary", proj] if proj else ["session-summary"],
-                         salience=0.55)
+                         salience=0.55, touch=False)
             if not r.get("deduped"):
                 added += 1
 
@@ -1439,7 +2041,7 @@ class Memory:
             r = self.add("路径：%s\n写入工具：%s\n会话：%s%s" % (pth, tool, sid, head),
                          title="产物 " + base, kind="artifact", project=proj,
                          source="session", source_ref=sid, salience=0.45,
-                         tags=["artifact", proj] if proj else ["artifact"])
+                         tags=["artifact", proj] if proj else ["artifact"], touch=False)
             if not r.get("deduped"):
                 added += 1
         with self.db:
@@ -1641,16 +2243,39 @@ class Memory:
                               "w": round(float(e["weight"]), 3)})
                 degree[e["src"]] += 1
                 degree[e["dst"]] += 1
-        nodes = [{
-            "id": r["id"], "title": r["title"], "kind": r["kind"], "project": r["project"],
-            "tags": [t for t in (r["tags"] or "").split(",") if t],
-            "salience": round(float(r["salience"]), 3), "pinned": bool(r["pinned"]),
-            "status": r["status"], "created_at": int(r["created_at"]),
-            "valid_to": int(r["valid_to"] or 0), "degree": degree[r["id"]],
-            "preview": re.sub(r"\s+", " ", r["body"])[:220],
-        } for r in rows]
+        t_now = now()
+        nodes, counts = [], {k: 0 for k in STATE_ORDER}
+        for r in rows:
+            st = self.memory_state(r, t_now)
+            counts[st["state"]] += 1
+            _t, body_out = self.mask_body(r, st["state"])
+            nodes.append({
+                "id": r["id"], "title": r["title"], "kind": r["kind"], "project": r["project"],
+                "tags": [t for t in (r["tags"] or "").split(",") if t],
+                "salience": round(float(r["salience"]), 3), "pinned": bool(r["pinned"]),
+                "status": r["status"], "created_at": int(r["created_at"]),
+                "valid_to": int(r["valid_to"] or 0), "degree": degree[r["id"]],
+                "preview": re.sub(r"\s+", " ", body_out)[:220],
+                "state": st["state"], "state_label": st["state_label"],
+                "activation": st["activation"], "age_days": st["age_days"],
+                "since_touch_days": st["since_touch_days"],
+                "halflife_days": st["halflife_days"], "wake_count": st["wake_count"],
+                "last_wake_at": st["last_wake_at"], "wake_weight": st["wake_weight"],
+                "sleep_override": st["sleep_override"],
+                "next_state_in_days": st["next_state_in_days"],
+                "triggers": self.memory_triggers(r),
+            })
+        dorm = self._dorm()
         return {"nodes": nodes, "edges": edges,
-                "meta": {"generated": now(), "total": len(nodes), "links": len(edges)}}
+                "meta": {"generated": t_now, "total": len(nodes), "links": len(edges),
+                         "states": counts,
+                         "dormancy": {
+                             "enabled": bool(dorm.get("enabled", True)),
+                             "thresholds": dict(dorm.get("thresholds") or {}),
+                             "wake_halflife_hours": float((dorm.get("wake") or {}).get(
+                                 "halflife_hours", 72.0)),
+                             "life_days": dict(dorm.get("life_days") or {}),
+                         }}}
 
     # 绝不让记忆索引去读可能是凭据的文件
     _SECRET_NAMES = (

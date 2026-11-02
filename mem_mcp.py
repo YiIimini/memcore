@@ -7,7 +7,7 @@ Wire it into any MCP client:
 
 Protocol: JSON-RPC 2.0 over stdio, newline-delimited JSON (Content-Length
 framing is also accepted). Tools: memory_search, memory_recall, memory_brief,
-memory_add, memory_get, memory_stats.
+memory_add, memory_get, memory_stats, memory_states, memory_wake.
 """
 from __future__ import annotations
 
@@ -80,8 +80,27 @@ TOOLS = [
     },
     {
         "name": "memory_stats",
-        "description": "Counts, kinds, projects and storage size.",
+        "description": "Counts, kinds, projects, storage size and the 清醒/模糊/沉睡/深度沉睡 breakdown.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "memory_states",
+        "description": "Memory lifecycle view: 清醒(fresh) / 模糊(fuzzy, body masked on recall) / "
+                       "沉睡(dormant, only strong cues recall it) / 深度沉睡(deep). "
+                       "Lists the sleeping ones with their activation and age.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "description": "fuzzy|dormant|deep (omit for all sleepers)"},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    },
+    {
+        "name": "memory_wake",
+        "description": "Wake one sleeping memory (raises its wake weight so it stays awake longer). "
+                       "Use when a cue reminds you of a dormant item.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     },
 ]
 
@@ -141,10 +160,13 @@ def call_tool(m: Memory, name: str, args: dict):
                         kinds=[args["kind"]] if args.get("kind") else [])
         if not hits:
             return _text("(no hits)")
-        return _text("\n".join(
-            "%s  %.2f  %s/%s  %s — %s" % (h["id"], h["score"], h["kind"],
-                                         h["project"] or "-", h["title"], h["body"][:200])
-            for h in hits))
+        def line(h):
+            mark = "" if h.get("state", "awake") == "awake" else "〔%s%s〕" % (
+                h.get("state_label", ""), "·已唤醒" if h.get("woke") else "")
+            return "%s%s  %.2f  %s/%s  %s — %s" % (
+                h["id"], mark, h["score"], h["kind"], h["project"] or "-",
+                h["title"], h["body"][:200])
+        return _text("\n".join(line(h) for h in hits))
     if name == "memory_recall":
         return _text(m.recall(args.get("query", ""), budget_tokens=int(args.get("budget", 900)),
                               project=args.get("project", ""))["text"])
@@ -161,6 +183,24 @@ def call_tool(m: Memory, name: str, args: dict):
         return _text(json.dumps(r, ensure_ascii=False, indent=2) if r else "not found")
     if name == "memory_stats":
         return _text(json.dumps(m.stats(), ensure_ascii=False, indent=2))
+    if name == "memory_states":
+        counts = m.state_counts()
+        rows = m.sleepers(limit=int(args.get("limit", 20)))
+        want = (args.get("state") or "").strip()
+        if want:
+            rows = [r for r in rows if r["state"] == want]
+        head = "清醒 %d · 模糊 %d · 沉睡 %d · 深度沉睡 %d" % (
+            counts["awake"], counts["fuzzy"], counts["dormant"], counts["deep"])
+        body = "\n".join("%s  %s  激活 %.2f  龄 %.1f 天  唤醒 %d 次  %s" % (
+            r["id"], r["state_label"], r["activation"], r["age_days"], r["wake_count"],
+            r["title"]) for r in rows)
+        return _text(head + ("\n" + body if body else "\n(沉睡区为空)"))
+    if name == "memory_wake":
+        st = m.wake(args.get("id", ""))
+        if not st:
+            return _text("not found")
+        return _text("%s → %s（激活度 %.2f，唤醒 %d 次）" % (
+            args.get("id", ""), st["state_label"], st["activation"], st["wake_count"]))
     raise KeyError("unknown tool: " + name)
 
 

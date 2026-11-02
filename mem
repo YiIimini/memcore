@@ -83,6 +83,8 @@ def main(argv=None) -> int:
     p.add_argument("--pin", action="store_true")
     p.add_argument("--ttl-days", type=int, default=0)
     p.add_argument("--no-dedupe", action="store_true")
+    p.add_argument("--trigger", default="",
+                   help="显式触发词（逗号分隔）：查询里出现就唤醒这条记忆")
 
     for name in ("search", "s"):
         p = sub.add_parser(name, help="ranked search")
@@ -121,6 +123,7 @@ def main(argv=None) -> int:
     p.add_argument("--salience", type=float)
     p.add_argument("--pin", dest="pinned", action="store_true")
     p.add_argument("--unpin", dest="pinned", action="store_false")
+    p.add_argument("--trigger", help="显式触发词（逗号分隔），传空串表示清空")
 
     p = sub.add_parser("forget", parents=[common], help="delete one memory")
     p.add_argument("id")
@@ -163,6 +166,36 @@ def main(argv=None) -> int:
     p.add_argument("id")
     p.add_argument("--depth", type=int, default=1)
 
+    p = sub.add_parser("wake", parents=[common], help="叫醒一条沉睡的记忆（唤醒权重 +1）")
+    p.add_argument("id")
+    p.add_argument("--reason", default="manual")
+
+    p = sub.add_parser("sleep", parents=[common], help="让它沉睡（内容保留，强线索仍可唤回）")
+    p.add_argument("id")
+    p.add_argument("--reason", default="manual")
+
+    p = sub.add_parser("unsleep", parents=[common], help="撤销人工沉睡，交还给时间与权重")
+    p.add_argument("id")
+
+    p = sub.add_parser("preflight", parents=[common],
+                       help="动手前查一次：这些文件/这个主题以前踩过什么坑")
+    p.add_argument("paths", nargs="*", default=[], help="文件或目录（可多个）")
+    p.add_argument("--topic", default="", help="没有具体文件时给个主题词")
+    p.add_argument("-n", "--limit", type=int, default=10)
+    p.add_argument("--budget", type=int, default=900)
+
+    p = sub.add_parser("learn", parents=[common],
+                       help="把刚踩的坑写回记忆（自动带 pitfall + 文件名标签）")
+    p.add_argument("--file", default="", help="出事的文件/目录（坑按它归档）")
+    p.add_argument("-t", "--title", required=True, help="一句话说清这个坑")
+    p.add_argument("--what", default="", help="现象：怎么发现的 / 表现是什么")
+    p.add_argument("--fix", default="", help="修法：下次直接照着做")
+    p.add_argument("--tags", default="", help="额外标签（逗号分隔）")
+
+    p = sub.add_parser("states", parents=[common], help="状态分布 / 沉睡区清单")
+    p.add_argument("--state", default="", help="只列某一档：fuzzy|dormant|deep")
+    p.add_argument("-n", "--limit", type=int, default=30)
+
     p = sub.add_parser("timeline", parents=[common], help="recent activity")
     p.add_argument("--days", type=int, default=30)
     p.add_argument("-p", "--project", default="")
@@ -194,10 +227,13 @@ def main(argv=None) -> int:
     try:
         if args.cmd == "add":
             tags = [t for t in args.tags.split(",") if t.strip()]
+            meta = {}
+            if args.trigger:
+                meta["triggers"] = [t.strip() for t in args.trigger.split(",") if t.strip()]
             r = m.add(args.body, title=args.title, kind=args.kind, tags=tags, project=args.project,
                       source=args.source, source_ref=args.source_ref, salience=args.salience,
                       confidence=args.confidence, pinned=args.pin, ttl_days=args.ttl_days,
-                      dedupe=not args.no_dedupe)
+                      dedupe=not args.no_dedupe, meta=meta)
             m.export_markdown()
             if args.json:
                 dump(r)
@@ -216,8 +252,11 @@ def main(argv=None) -> int:
                 if not hits:
                     out("(no hits)")
                 for h in hits:
-                    out("%s  %.3f  lex=%.2f sem=%.2f  %s  %s  %s" % (
-                        h["id"], h["score"], h["lexical"], h["semantic"], h["kind"],
+                    mark = "" if h.get("state", "awake") == "awake" else "〔%s〕" % h.get(
+                        "state_label", h.get("state"))
+                    woke = "·已唤醒" if h.get("woke") else ""
+                    out("%s%s%s  %.3f  lex=%.2f sem=%.2f  %s  %s  %s" % (
+                        h["id"], mark, woke, h["score"], h["lexical"], h["semantic"], h["kind"],
                         h["project"] or "-", h["title"]))
             return 0
 
@@ -258,6 +297,20 @@ def main(argv=None) -> int:
                 out("tags : %s" % r["tags"])
                 out("meta : salience=%.2f conf=%.2f pinned=%s uses=%d src=%s" % (
                     r["salience"], r["confidence"], bool(r["pinned"]), r["use_count"], r["source"]))
+                st = m.memory_state(r)
+                wake_txt = ("唤醒 %d 次" % st["wake_count"]) if st["wake_count"] else "从未唤醒"
+                last = ("%.1f 天前" % ((time.time() - st["last_wake_at"]) / 86400)) \
+                    if st["last_wake_at"] else "从未"
+                out("state: %s  激活度 %.2f  记忆龄 %.1f 天 / 保质期 %.1f 天 · %s · 最近唤醒 %s" % (
+                    st["state_label"], st["activation"], st["age_days"], st["halflife_days"],
+                    wake_txt, last))
+                cues = m.memory_triggers(r)
+                if cues:
+                    out("暗号: %s（查询里出现就会唤醒它）" % "、".join(cues))
+                if st["state"] != "awake":
+                    # 显式翻看 = 一次注意：记忆被点亮，正文才是完整的
+                    m.wake(args.id, "manual")
+                    out("（这条记忆原处于「%s」，你翻开了它 —— 已唤醒）" % st["state_label"])
                 out("-" * 60)
                 out(r["body"])
             return 0
@@ -272,6 +325,8 @@ def main(argv=None) -> int:
                 fields["tags"] = [t for t in args.tags.split(",") if t]
             if args.pinned is not None:
                 fields["pinned"] = args.pinned
+            if args.trigger is not None:
+                fields["meta"] = {"triggers": [t.strip() for t in args.trigger.split(",") if t.strip()]}
             ok = m.update(args.id, **fields)
             m.export_markdown()
             out("updated" if ok else "no-op")
@@ -346,6 +401,70 @@ def main(argv=None) -> int:
                     out("%s%s [%s] %s" % ("  " * n["depth"], n["id"], n["kind"], n["title"]))
                 for e in g["edges"]:
                     out("  %s -%s-> %s (%.1f)" % (e["src"], e["rel"], e["dst"], e["w"]))
+            return 0
+
+        if args.cmd in ("wake", "sleep", "unsleep"):
+            fn = {"wake": m.wake, "sleep": m.sleep, "unsleep": m.unsleep}[args.cmd]
+            st = fn(args.id, getattr(args, "reason", "manual")) if args.cmd != "unsleep" \
+                else fn(args.id)
+            if not st:
+                out("not found: %s" % args.id)
+                return 1
+            if args.json:
+                dump(st)
+            else:
+                out("%s \u2192 %s（激活度 %.2f）" % (args.id, st["state_label"], st["activation"]))
+            return 0
+
+        if args.cmd == "preflight":
+            r = m.preflight(args.paths, topic=args.topic, limit=args.limit,
+                            budget_tokens=args.budget)
+            if args.json:
+                dump(r)
+            else:
+                out(r["text"])
+            return 0
+
+        if args.cmd == "learn":
+            keys = m._path_keys([args.file] if args.file else [])
+            tags = ["pitfall"] + keys + [t.strip().lower() for t in args.tags.split(",") if t.strip()]
+            body = []
+            if args.what:
+                body.append("现象：" + args.what.strip())
+            if args.fix:
+                body.append("修法：" + args.fix.strip())
+            if not body:
+                body.append("现象：(未填)　修法：(未填)")
+            r = m.add("\n".join(body), title=args.title.strip(), kind="insight",
+                      tags=list(dict.fromkeys(tags)), salience=0.9, source="learn")
+            m.export_markdown()
+            if args.json:
+                dump({"id": r["id"], "tags": tags, "deduped": r.get("deduped")})
+            else:
+                out("%s 已记为雷区%s" % (r["id"], "（同一条已存在，已强化）" if r.get("deduped") else ""))
+            return 0
+
+        if args.cmd == "states":
+            counts = m.state_counts()
+            if not args.state:
+                rows = m.sleepers(limit=args.limit)
+            else:
+                rows = [r for r in m.sleepers(limit=1000) if r["state"] == args.state][: args.limit]
+            if args.json:
+                dump({"counts": counts, "items": rows})
+            else:
+                out("清醒 %d · 模糊 %d · 沉睡 %d · 深度沉睡 %d"
+                    % (counts["awake"], counts["fuzzy"], counts["dormant"], counts["deep"]))
+                for r in rows:
+                    nxt = ("%.1f 天后掉档" % r["next_state_in_days"]) \
+                        if r["next_state_in_days"] is not None else "已到底/被钉住"
+                    quiet = r.get("since_touch_days", r["age_days"])
+                    cues = ("  暗号:" + ",".join(r["triggers"])) if r.get("triggers") else ""
+                    out("%s  %-4s 激活 %.2f  龄 %.1f 天 / %.1f 天没想起  %s  唤醒 %d 次  %s%s"
+                        % (r["id"], r["state_label"], r["activation"], r["age_days"], quiet, nxt,
+                           r["wake_count"], r["title"][:36], cues))
+                if rows:
+                    out("叫醒：mem wake <ID>")
             return 0
 
         if args.cmd == "timeline":

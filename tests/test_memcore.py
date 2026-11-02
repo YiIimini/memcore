@@ -1,4 +1,4 @@
-import json, os, shutil, sys, tempfile, unittest
+import json, os, shutil, sys, tempfile, time, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import memcore
@@ -294,6 +294,201 @@ class TestGraphFeatures(Base):
         meta = json.loads(self.m.get(mid)["meta"])
         self.assertEqual(meta.get("prio"), 3)
         self.assertEqual(meta.get("retire_reason"), "改用别的方案")
+
+
+class TestPreflight(Base):
+    """动手前查雷区：坑按文件名归档，preflight 必须把它捞出来。"""
+
+    def _learn(self, file, title, what, fix):
+        keys = self.m._path_keys([file])
+        return self.m.add("现象：%s\n修法：%s" % (what, fix), title=title, kind="insight",
+                          tags=["pitfall"] + keys, salience=0.9)["id"]
+
+    def test_preflight_finds_pitfall_by_file(self):
+        pit = self._learn("memcore.py", "查询列集不一致", "两处分布打架", "统一列集常量")
+        self.m.add("别的东西", title="无关条目", kind="note")
+        r = self.m.preflight(["memcore.py"])
+        ids = [i["id"] for i in r["items"]]
+        self.assertIn(pit, ids)
+        self.assertTrue(r["items"][0]["pitfall"])
+        self.assertIn("修法", r["text"])
+
+    def test_preflight_matches_directory_and_stem(self):
+        pit = self._learn("ui/nebula.html", "面板数字回跳", "刷新拿到首屏快照", "先请求接口再回落")
+        for q in (["ui/nebula.html"], ["nebula"], ["ui"]):
+            self.assertIn(pit, [i["id"] for i in self.m.preflight(q)["items"]], q)
+
+    def test_preflight_empty_is_honest(self):
+        r = self.m.preflight(["不存在的模块.py"])
+        self.assertEqual(r["items"], [])
+        self.assertIn("没有相关记录", r["text"])
+
+    def test_preflight_prefers_pitfalls_over_background(self):
+        pit = self._learn("memcore.py", "坑一号", "现象", "修法")
+        for i in range(5):
+            self.m.add("背景资料 %d，讲 memcore.py 的架构" % i,
+                       title="背景 %d" % i, kind="note", tags=["memcore.py"])
+        items = self.m.preflight(["memcore.py"], limit=8)["items"]
+        self.assertEqual(items[0]["id"], pit)
+        self.assertLessEqual(len([i for i in items if not i["pitfall"]]), 3)
+
+    def test_brief_surfaces_pitfall_count(self):
+        self._learn("memcore.py", "随便一个坑", "现象", "修法")
+        self.assertIn("已知雷区", self.m.brief(budget_tokens=900))
+
+
+class TestDormancy(Base):
+    """记忆模糊 + 部分记忆沉睡：时间衰减、重要权重、特定线索唤醒、唤醒权重。"""
+
+    def _aged(self, mid, days, use_count=0, last_used=0):
+        ts = int(time.time() - days * 86400)
+        self.m.db.execute(
+            "UPDATE memories SET updated_at=?, last_used_at=?, use_count=? WHERE id=?",
+            (ts, min(ts, last_used or ts), use_count, mid))
+        self.m.db.commit()
+
+    def test_activation_decays_with_time(self):
+        mid = self.m.add("会话里的一句闲聊片段，用来观察衰减。", title="闲聊片段",
+                         kind="episode", salience=0.4)["id"]
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "awake")
+        self._aged(mid, 1.0)
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "fuzzy")
+        self._aged(mid, 2.0)
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "dormant")
+        self._aged(mid, 12.0)
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "deep")
+
+    def test_importance_keeps_memory_awake(self):
+        """同样的年龄，重要（显著度高 + 反复复用）的记忆醒着，碎片沉下去。"""
+        trivial = self.m.add("随手记的一句话", title="碎片", kind="episode", salience=0.2)["id"]
+        vital = self.m.add("所有输出必须中文直接给结论", title="铁律", kind="preference",
+                           salience=1.0)["id"]
+        self._aged(trivial, 3.0)
+        self._aged(vital, 3.0, use_count=20)
+        self.assertNotEqual(self.m.memory_state(self.m.get(trivial))["state"], "awake")
+        self.assertEqual(self.m.memory_state(self.m.get(vital))["state"], "awake")
+
+    def test_pinned_never_sleeps(self):
+        mid = self.m.add("钉住的事实", title="钉住", kind="fact", pinned=True)["id"]
+        self._aged(mid, 365.0)
+        st = self.m.memory_state(self.m.get(mid))
+        self.assertEqual(st["state"], "awake")
+        self.assertGreaterEqual(st["activation"], 0.79)
+
+    def test_manual_sleep_and_unsleep(self):
+        mid = self.m.add("可以手动让它睡的记忆", title="手动沉睡", kind="fact")["id"]
+        self.assertEqual(self.m.sleep(mid)["state"], "dormant")
+        self.assertEqual(self.m.get(mid)["sleep_override"], "dormant")
+        self.assertEqual(self.m.unsleep(mid)["state"], "awake")
+        self.assertEqual(self.m.get(mid)["sleep_override"], "")
+
+    def test_wake_raises_state_and_weight(self):
+        mid = self.m.add("被叫醒的记忆", title="叫醒", kind="episode", salience=0.4)["id"]
+        self._aged(mid, 4.0)
+        self.assertNotEqual(self.m.memory_state(self.m.get(mid))["state"], "awake")
+        st = self.m.wake(mid)
+        self.assertGreater(st["wake_count"], 0)
+        self.assertGreater(st["wake_weight"], 0.0)
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "awake")
+        # 唤醒权重按小时衰减：72h 半衰期
+        self.m.db.execute("UPDATE memories SET last_wake_at=? WHERE id=?",
+                          (int(time.time() - 72 * 3600), mid))
+        self.m.db.commit()
+        self.assertLess(self.m.wake_weight(self.m.get(mid)), 0.5)
+        self.assertGreater(self.m.wake_weight(self.m.get(mid)), 0.2)
+
+    def test_fuzzy_body_is_masked_and_stable(self):
+        body = ("斗鱼直播平台接入用的是原生桥，抖音和快手走通用桥，"
+                "推流参数放在 config/stream.yaml，编码走 h264 硬件。")
+        mid = self.m.add(body, title="直播平台接入方案", kind="episode", salience=0.4)["id"]
+        self._aged(mid, 1.0)
+        hit = self.m.search("直播平台接入")[0]
+        self.assertEqual(hit["state"], "fuzzy")
+        self.assertIn("░", hit["body"])
+        self.assertLess(len(hit["body"]), len(body) + 8)
+        # 雾化花纹稳定：同一条记忆两次召回长得一样
+        self.assertEqual(hit["body"], self.m.search("直播平台接入")[0]["body"])
+
+    def test_dormant_needs_a_strong_cue(self):
+        mid = self.m.add("斗鱼直播平台接入用的是原生桥，推流参数在 config/stream.yaml。",
+                         title="直播平台接入方案", kind="episode", salience=0.4)["id"]
+        self._aged(mid, 4.0)
+        self.assertNotEqual(self.m.memory_state(self.m.get(mid))["state"], "awake")
+        # 模糊线索（改写、无锚点）叫不醒：先确认不会被当成清醒结果返回
+        weak = self.m.search("平台方案的编码硬件参数是啥")
+        self.assertFalse([h for h in weak if h["id"] == mid and h["state"] == "awake"])
+        # 精确线索一出现就唤醒
+        hits = self.m.search("推流参数 config/stream.yaml")
+        woke = [h for h in hits if h["id"] == mid]
+        self.assertTrue(woke, "精确线索应能唤回沉睡记忆")
+        self.assertTrue(woke[0]["woke"])
+        self.assertGreater(self.m.get(mid)["wake_count"], 0)
+
+    def test_trigger_cooldown_prevents_repeat_wake(self):
+        mid = self.m.add("冷却期内不该被连续唤醒", title="冷却", kind="episode", salience=0.4)["id"]
+        self._aged(mid, 4.0)
+        self.m.wake(mid, "trigger")
+        first = self.m.get(mid)["wake_count"]
+        self.assertIsNone(self.m.wake(mid, "trigger"))
+        self.assertEqual(self.m.get(mid)["wake_count"], first)
+
+    def test_explicit_trigger_word_wakes_deep_memory(self):
+        mid = self.m.add("生产部署走蓝色通道，回滚脚本在 ops/rollback.sh。", title="部署口令",
+                         kind="episode", salience=0.3,
+                         meta={"triggers": ["部署", "上线"]})["id"]
+        self._aged(mid, 8.0)
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "deep")
+        # 无关查询不该把它叫醒
+        self.assertFalse([h for h in self.m.search("最近有什么新安排") if h["id"] == mid])
+        self.assertEqual(self.m.memory_state(self.m.get(mid))["state"], "deep")
+        # 触发词命中：这条记忆自己声明的钥匙
+        hits = [h for h in self.m.search("这周要上线了") if h["id"] == mid]
+        self.assertTrue(hits and hits[0]["woke"])
+
+    def test_state_counts_and_graph_export(self):
+        self.m.add("清醒的", title="一", kind="fact", salience=1.0)
+        old = self.m.add("沉睡的", title="二", kind="episode", salience=0.2)["id"]
+        self._aged(old, 6.0)
+        counts = self.m.state_counts()
+        self.assertEqual(sum(counts.values()), 2)
+        self.assertEqual(counts["awake"], 1)
+        self.assertGreaterEqual(counts["dormant"] + counts["deep"], 1)
+        g = self.m.graph_export()
+        node = [n for n in g["nodes"] if n["id"] == old][0]
+        for key in ("state", "state_label", "activation", "age_days", "halflife_days",
+                    "wake_count", "last_wake_at", "wake_weight", "sleep_override",
+                    "next_state_in_days"):
+            self.assertIn(key, node)
+        self.assertIn("states", g["meta"])
+        self.assertEqual(g["meta"]["states"]["awake"], 1)
+
+    def test_sleepers_lists_only_sleeping(self):
+        self.m.add("清醒的条目", title="醒", kind="fact", salience=1.0)
+        slept = self.m.add("沉睡条目", title="睡", kind="episode", salience=0.2)["id"]
+        self._aged(slept, 6.0)
+        ids = [r["id"] for r in self.m.sleepers(10)]
+        self.assertIn(slept, ids)
+        self.assertEqual(len(ids), 1)
+
+    def test_counts_match_graph_export(self):
+        """state_counts 的列集必须和 graph_export 一致：漏一列就会算出两套分布。"""
+        a = self.m.add("用过的记忆", title="用过", kind="episode", salience=0.4)["id"]
+        self._aged(a, 6.0)
+        # 写完之后又被召回：last_used_at 比 updated_at 新 —— 这正是当初漏列的场景
+        self.m.db.execute("UPDATE memories SET last_used_at=? WHERE id=?",
+                          (int(time.time()), a))
+        self.m.db.commit()
+        counts = self.m.state_counts()
+        self.assertEqual(counts, self.m.graph_export()["meta"]["states"])
+        self.assertEqual(sum(counts.values()), self.m.stats()["total"])
+
+    def test_mask_text_is_deterministic_and_keeps_ends(self):
+        a = memcore.mask_text("一二三四五六七八九十甲乙丙丁戊己庚辛", "M00001")
+        b = memcore.mask_text("一二三四五六七八九十甲乙丙丁戊己庚辛", "M00001")
+        self.assertEqual(a, b)
+        self.assertTrue(a.startswith("一二三"))
+        self.assertTrue(a.endswith("庚辛"))
+        self.assertNotEqual(a, memcore.mask_text("一二三四五六七八九十甲乙丙丁戊己庚辛", "M00002"))
 
 
 if __name__ == "__main__":

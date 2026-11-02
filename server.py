@@ -301,7 +301,7 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                 if autostart is None:
                     self._json({"error": "后台任务在当前离线平台不可用"}, 400)
                     return
-            if name in ("pin", "unpin", "retire", "forget"):
+            if name in ("pin", "unpin", "retire", "forget", "wake", "sleep", "unsleep"):
                 if not ID_RE.match(mid):
                     self._json({"error": "bad id"}, 400)
                     return
@@ -321,6 +321,13 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
             elif name == "unpin":
                 m.update(mid, pinned=False)
                 self._json({"ok": True, "result": {"id": mid, "pinned": False}})
+            elif name in ("wake", "sleep", "unsleep"):
+                fn = {"wake": m.wake, "sleep": m.sleep, "unsleep": m.unsleep}[name]
+                st = fn(mid)
+                if not st:
+                    self._json({"error": "not found"}, 404)
+                    return
+                self._json({"ok": True, "result": dict(st, id=mid)})
             elif name == "retire":
                 m.retire(mid, reason=str(payload.get("reason") or "面板操作")[:200])
                 self._json({"ok": True, "result": {"id": mid, "status": "retired"}})
@@ -392,6 +399,18 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                         with lock:
                             cache["models"] = (now, out)
                         self._json(out)
+                elif u.path == "/api/pitfalls":
+                    limit = _int(qs.get("limit", ["200"])[0], 200, 1, 1000)
+                    self._json(m.pitfalls(file=(qs.get("file", [""])[0] or "")[:120], limit=limit))
+                elif u.path == "/api/preflight":
+                    raw = (qs.get("paths", [""])[0] or "")[:600]
+                    paths = [p.strip() for p in re.split(r"[,;\s]+", raw) if p.strip()][:12]
+                    topic = (qs.get("topic", [""])[0] or "")[:200]
+                    limit = _int(qs.get("limit", ["10"])[0], 10, 1, 50)
+                    self._json(m.preflight_payload(paths, topic=topic, limit=limit))
+                elif u.path == "/api/sleepers":
+                    limit = _int(qs.get("limit", ["60"])[0], 60, 1, 500)
+                    self._json({"items": m.sleepers(limit=limit), "states": m.state_counts()})
                 elif u.path == "/api/search":
                     q = (qs.get("q", [""])[0] or "")[:400]
                     self._json(m.search(q, limit=_int(qs.get("limit", [20])[0], 20, 1, 200)))
@@ -404,6 +423,16 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
                     if not row:
                         self._json({"error": "not found"}, 404)
                     else:
+                        st = m.memory_state(row)
+                        if st["state"] != "awake":
+                            # 显式打开一条记忆 = 一次注意，把它点亮（正文也就完整了）
+                            m.wake(mid, "manual")
+                            st = m.memory_state(m.get(mid) or row)
+                        row.update({k: st[k] for k in (
+                            "state", "state_label", "activation", "age_days",
+                            "since_touch_days", "halflife_days",
+                            "wake_count", "last_wake_at", "wake_weight", "sleep_override",
+                            "next_state_in_days")})
                         row["edges"] = [dict(e) for e in m.db.execute(
                             "SELECT src,dst,rel,weight FROM links WHERE src=? OR dst=?", (mid, mid))]
                         self._json(row)
