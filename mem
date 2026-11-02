@@ -150,6 +150,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("history", parents=[common], help="supersedes chain around one memory")
     p.add_argument("id")
+    p.add_argument("--as-of", default=None, help="回到某个时点：取那一刻有效的那一版")
 
     p = sub.add_parser("relink", parents=[common], help="rebuild semantic related-edges")
     p.add_argument("--limit", type=int, default=4000)
@@ -174,6 +175,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("graph", parents=[common], help="neighbourhood of a memory")
     p.add_argument("id")
     p.add_argument("--depth", type=int, default=1)
+    p.add_argument("--as-of", default=None, help="只显示那一刻仍然成立的边")
 
     p = sub.add_parser("wake", parents=[common], help="叫醒一条沉睡的记忆（唤醒权重 +1）")
     p.add_argument("id")
@@ -371,7 +373,11 @@ def main(argv=None) -> int:
             return 0 if ok else 1
 
         if args.cmd == "history":
-            h = m.history(args.id)
+            h = m.history(args.id, as_of=parse_when(args.as_of))
+            if h.get("as_of"):
+                pick = h.get("at")
+                out("时点 %s 的版本：%s" % (time.strftime("%Y-%m-%d", time.localtime(h["as_of"])),
+                                           ("%s %s" % (pick["id"], pick["title"][:50])) if pick else "(该时点无记录)"))
             for r in h["chain"]:
                 mark = "●" if r["id"] == args.id else "○"
                 out("%s %s  %s  %s  %s" % (mark, r["id"],
@@ -414,7 +420,7 @@ def main(argv=None) -> int:
             return 0
 
         if args.cmd == "graph":
-            g = m.graph(args.id, args.depth)
+            g = m.graph(args.id, args.depth, as_of=parse_when(args.as_of))
             if args.json:
                 dump(g)
             else:

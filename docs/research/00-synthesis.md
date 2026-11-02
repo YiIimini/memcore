@@ -145,6 +145,9 @@ R@1/R@3 仍是 **10/12、11/12，MRR 0.881 → 0.881**；把注入强度拉到 4
 | ⑤ | `recall` 空结果显式回落并标注（`preflight` 保持不回落） | HippoRAG fallback | 单测覆盖"不伪装成命中" |
 | — | **派生摘要折价** `weights.derived=0.90`：会话回顾"抄了全场意图"，纯词法下必然压过一手条目 | 硬评测暴露（A-MEM/A-MEM 的 summary 反例） | 硬评测 R@1 21→23/37、MRR 0.752→0.788 |
 | — | `weights.norm = minmax\|sigmoid` 留开关，便于长期 A/B | — | 消融见下表 |
+| ② | `links` 双时态：`valid_at/invalid_at` 两列 + 迁移回填；`supersedes/contradicts/corrects` 新事实一到，指向同一目标的旧边失效（锚定新 fact 的 valid_at）；`related` 永不失效 | Graphiti | 单测覆盖失效/不失效/as_of 裁边 |
+| ② | `mem graph --as-of` / `mem history --as-of`：那一刻成立的边 / 那一刻有效的那一版 | Graphiti + Cognee | 单测 + CLI 冒烟 |
+| ④ | `consolidate` 水位线（`consolidate_at`），默认只体检增量；`brief` 截断时写明"另有 N 条未展开" | Memobase / Letta | 单测 + `mem brief --budget 260` 实测 |
 
 **消融（硬评测 37 条）**
 

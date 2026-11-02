@@ -260,6 +260,20 @@ $M search "推流参数" --json       # 每条结果带 state / state_label / ac
 
 老尺子 `tests_eval.py` 同期 10/12 → **12/12**。硬评测依赖本机真实库，不进 CI（跑法见 [docs/Eval-Hard.md](docs/Eval-Hard.md)）。
 
+## 4.54 边也有有效期（双时态）
+
+`links` 现在带 `valid_at / invalid_at`：关系不是只有"存在/不存在"，还有"什么时候成立、什么时候被取代"。
+
+- 写 `supersedes / contradicts / corrects` 这类**显式语义关系**时，指向同一目标的旧关系会在新事实的
+  `valid_at` 那一刻失效（不是 `now()`），行不删、历史留着。
+- `related` 是余弦自动连的相似边，**永不失效**——拿它做冲突判定会让两条相似记忆互相打残。
+- `mem graph <id> --as-of 2026-11-02` 只显示"那一刻仍然成立"的边；`mem history <id> --as-of ...`
+  取的是"那一刻有效的那一版"。
+- `mem add --event-at` 写事件时间；不传时回落写入时间，**绝不写 0**（0 在 `as_of` 语义里等于"无下界"）。
+
+顺带两处"别静默失败"：`brief` 预算不够砍掉条目时会写明"另有 N 条未展开"；`consolidate` 加了
+`consolidate_at` 水位线，默认只体检上次之后变过的条目（`--full` 可全量），不再每次把同一批旧条目反复咀嚼。
+
 ## 4.55 调研笔记：别人怎么做的
 
 `docs/research/` 是一份 9 个记忆系统的源码级拆解（Mem0、Letta、Zep/Graphiti、Cognee、A-MEM、HippoRAG、

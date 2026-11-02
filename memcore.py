@@ -94,7 +94,9 @@ DEFAULT_CONFIG = {
         # （0 = 关闭；调这个值前先跑 tests_eval_hard.py）
         "ppr": 0.0,   # 实测在硬评测上反而更差，默认关；留开关做实验
         # 时间问句：查询里出现"最早/第一次"就反过来奖励旧记忆，出现"最近/后来"奖励新记忆
-        "time_intent": 0.0,   # 两版实现（recency 标量 / 时间序）都没测出收益，默认关
+        "time_intent": 0.0,   # 全局加权实测无效（负结果留档），默认关
+        # 时间问句改成"分数带内按事件时间重排"：只在并列带里用时间决胜
+        "time_band": 0.85,
     },
     # 检索空结果时是否回落（只在"该有答案"的通道上开：recall 开，preflight 永不开）
     "recall": {"fallback": True, "fallback_n": 6},
@@ -441,7 +443,9 @@ CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 CREATE TABLE IF NOT EXISTS entities (memory_id TEXT NOT NULL, name TEXT NOT NULL, etype TEXT NOT NULL DEFAULT 'term', PRIMARY KEY(memory_id, name));
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
 CREATE TABLE IF NOT EXISTS links (src TEXT NOT NULL, dst TEXT NOT NULL, rel TEXT NOT NULL DEFAULT 'related',
-  weight REAL NOT NULL DEFAULT 1.0, created_at INTEGER NOT NULL, PRIMARY KEY(src, dst, rel));
+  weight REAL NOT NULL DEFAULT 1.0, created_at INTEGER NOT NULL,
+  valid_at INTEGER NOT NULL DEFAULT 0, invalid_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(src, dst, rel));
 CREATE TABLE IF NOT EXISTS vectors (memory_id TEXT PRIMARY KEY, v BLOB NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(memory_id UNINDEXED, text, tokenize='trigram');
 CREATE TABLE IF NOT EXISTS access_log (id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT, ts INTEGER, q TEXT);
@@ -481,6 +485,18 @@ class Memory:
             if col not in have:
                 self.db.execute("ALTER TABLE memories ADD COLUMN %s %s" % (col, ddl))
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status)")
+        # links 的时间轴：老库没有这两列，逐列重读（一次读到的 cols 不含刚 ADD 的列）
+        added_temporal = False
+        for col, ddl in (("valid_at", "INTEGER NOT NULL DEFAULT 0"),
+                         ("invalid_at", "INTEGER NOT NULL DEFAULT 0")):
+            have = {r[1] for r in self.db.execute("PRAGMA table_info(links)")}
+            if col not in have:
+                self.db.execute("ALTER TABLE links ADD COLUMN %s %s" % (col, ddl))
+                added_temporal = True
+        if added_temporal:
+            # 只在刚加列时回填一次：老边"从建边起有效"（0 在 as_of 语义里等于无下界）。
+            # 每次开库都跑会把"显式设置的 valid_at=0/未来值"洗掉。
+            self.db.execute("UPDATE links SET valid_at=created_at WHERE valid_at=0")
         self.db.commit()
         self._meta_init()
 
@@ -959,13 +975,14 @@ class Memory:
                 self.db.execute("UPDATE memories SET meta=? WHERE id=?",
                                 (json.dumps(old_meta, ensure_ascii=False), mid))
             if by:
+                # supersedes 的生效时刻就是"旧口径作废的时刻"，锚在这里而不是建边时刻
                 self.db.execute(
-                    "INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at) VALUES(?,?,?,?,?)",
-                    (by, mid, "supersedes", 1.0, now()))
+                    "INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at,valid_at,invalid_at)"
+                    " VALUES(?,?,?,?,?,?,0)", (by, mid, "supersedes", 1.0, ts, ts))
         self._journal("retire", mid, {"by": by, "reason": reason})
         return True
 
-    def history(self, mid: str) -> Dict[str, Any]:
+    def history(self, mid: str, as_of: Optional[int] = None) -> Dict[str, Any]:
         """Supersedes chain around one memory, ordered oldest -> newest."""
         older: List[Dict[str, Any]] = []
         cur, seen = mid, {mid}
@@ -995,7 +1012,20 @@ class Memory:
             newer.append(r)
             cur = row["src"]
         me = self.get(mid)
-        return {"chain": older + ([me] if me else []) + newer, "current": mid}
+        chain = older + ([me] if me else []) + newer
+        out: Dict[str, Any] = {"chain": chain, "current": mid}
+        if as_of:
+            # 回到某个时点：取覆盖该时点的那一版（valid_from <= t < valid_to）
+            pick = None
+            for r in chain:
+                vf = int(r.get("valid_from") or 0)
+                vt = int(r.get("valid_to") or 0)
+                if (vf == 0 or vf <= as_of) and (vt == 0 or vt > as_of):
+                    pick = r
+                    break
+            out["as_of"] = int(as_of)
+            out["at"] = pick
+        return out
 
     def _auto_links(self, mid: str, text: str, vec: Optional[bytes] = None) -> int:
         cfg = self.cfg.get("autolink", {})
@@ -1018,17 +1048,46 @@ class Memory:
             a, b = (mid, other) if mid < other else (other, mid)
             with self.db:
                 self.db.execute(
-                    "INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at) VALUES(?,?,?,?,?)",
-                    (a, b, "related", round(sim, 3), now()))
+                    "INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at,valid_at,invalid_at)"
+                    " VALUES(?,?,?,?,?,?,0)",
+                    (a, b, "related", round(sim, 3), now(), now()))
             n += 1
         return n
 
-    def link(self, src: str, dst: str, rel: str = "related", weight: float = 1.0) -> bool:
+    INVALIDATING_RELS = ("supersedes", "contradicts", "corrects")
+
+    def invalidate_pair(self, src: str, dst: str, rel: str, at: int) -> int:
+        """让同一对实体上旧的关系失效：锚定新事实的 valid_at，而不是 now()。
+
+        只对显式语义关系（supersedes/contradicts/corrects）生效 —— `related` 是
+        余弦自动连出来的相似边，拿它做"冲突"会让两条相似记忆互相打残。
+        """
+        if rel not in self.INVALIDATING_RELS:
+            return 0
+        with self.db:
+            # 同一个"被取代的目标"同时只能有一个现行取代者：
+            # 当 X supersedes T 时，其它 (Y -> T, supersedes) 一并失效。
+            cur = self.db.execute(
+                "UPDATE links SET invalid_at=? WHERE dst=? AND rel=?"
+                " AND invalid_at=0 AND valid_at<? AND src<>?",
+                (int(at), dst, rel, int(at), src))
+        return cur.rowcount or 0
+
+    def link(self, src: str, dst: str, rel: str = "related", weight: float = 1.0,
+             valid_at: Optional[int] = None) -> bool:
         if not self.get(src) or not self.get(dst):
             return False
+        at = int(valid_at or now())
         with self.db:
-            self.db.execute("INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at) VALUES(?,?,?,?,?)",
-                            (src, dst, rel, weight, now()))
+            if rel in self.INVALIDATING_RELS:
+                # 新事实一到，指向同一目标的旧关系就地失效（不删行，保留历史）
+                self.db.execute(
+                    "UPDATE links SET invalid_at=? WHERE dst=? AND rel=?"
+                    " AND invalid_at=0 AND valid_at<? AND src<>?",
+                    (at, dst, rel, at, src))
+            self.db.execute(
+                "INSERT OR REPLACE INTO links(src,dst,rel,weight,created_at,valid_at,invalid_at)"
+                " VALUES(?,?,?,?,?,?,0)", (src, dst, rel, weight, at, at))
         return True
 
     # -- read -------------------------------------------------------------
@@ -1813,6 +1872,7 @@ class Memory:
                 "lexical": round(lexn.get(mid, 0.0), 3), "recency": round(rec, 3),
                 "salience": float(r["salience"]), "pinned": bool(r["pinned"]),
                 "use_count": int(r["use_count"]), "created_at": int(r["created_at"]),
+                "event_at": int(r.get("valid_from") or r["created_at"]),
                 "updated_at": int(r["updated_at"]), "_sim": int(r["sim"] or 0),
                 "state": state, "state_label": st["state_label"],
                 "activation": st["activation"], "trigger": trigger, "woke": woke,
@@ -1821,6 +1881,17 @@ class Memory:
                 "triggers": self.memory_triggers(r),
             })
         out.sort(key=lambda x: x["score"], reverse=True)
+        if global_time_intent and float(w.get("time_band", 0.0)) > 0 and len(out) > 2:
+            # "最早那次"不靠加权（实测动不了分），而是**只在并列带内按事件时间重排**：
+            # 分差大的不许翻盘，分差小的才用时间决胜。
+            band = float(w.get("time_band", 0.85))
+            top_s = out[0]["score"]
+            head = [h for h in out if h["score"] >= top_s * band][:8]
+            head_ids = {id(h) for h in head}
+            tail = [h for h in out if id(h) not in head_ids]
+            head.sort(key=lambda h: int(h.get("event_at") or h.get("created_at") or 0),
+                      reverse=(global_time_intent == "late"))
+            out = head + tail
         ppr_w = float(w.get("ppr", 0.0))
         if ppr_w > 0 and len(out) > 3:
             self._ppr_boost(out, alpha=0.5, iters=8, lam=ppr_w)
@@ -1985,12 +2056,18 @@ class Memory:
             if not rows:
                 return
             block = ["## " + title]
+            shown = 0
             for r in rows[:cap]:
                 line = fmt(r) if fmt else self._format_hit(self._row_to_hit(r), compact=True)
                 if used + est_tokens(line) > budget_tokens:
                     break
                 block.append("- " + line)
                 used += est_tokens(line)
+                shown += 1
+            cut = min(len(rows), cap) - shown
+            if shown and cut > 0:
+                # 静默截断会让人以为"就这么点"，必须说出来
+                block.append("- …另有 %d 条未展开（`mem recall` 或加大 --budget）" % cut)
             if len(block) > 1:
                 lines.extend(block)
 
@@ -2044,8 +2121,17 @@ class Memory:
                 "activation": st["activation"], "woke": False}
 
     # -- graph / timeline -------------------------------------------------
-    def graph(self, mid: str, depth: int = 1) -> Dict[str, Any]:
+    def graph(self, mid: str, depth: int = 1, as_of: Optional[int] = None,
+              include_expired: bool = True) -> Dict[str, Any]:
+        """邻域图。as_of 给定时按边的有效期裁：只保留那一刻成立的边。"""
         nodes, edges = {}, []
+        edge_where = ""
+        edge_params: List[Any] = []
+        if as_of:
+            edge_where = " AND (valid_at=0 OR valid_at<=?) AND (invalid_at=0 OR invalid_at>?)"
+            edge_params = [int(as_of), int(as_of)]
+        elif not include_expired:
+            edge_where = " AND invalid_at=0"
         frontier = {mid}
         for d in range(depth + 1):
             nxt = set()
@@ -2055,7 +2141,8 @@ class Memory:
                     continue
                 nodes[n] = {"id": n, "kind": r["kind"], "title": r["title"], "depth": d}
                 for e in self.db.execute(
-                        "SELECT src,dst,rel,weight FROM links WHERE src=? OR dst=? LIMIT 60", (n, n)):
+                        "SELECT src,dst,rel,weight FROM links WHERE (src=? OR dst=?)%s LIMIT 60"
+                        % edge_where, [n, n] + edge_params):
                     edges.append({"src": e["src"], "dst": e["dst"], "rel": e["rel"], "w": e["weight"]})
                     other = e["dst"] if e["src"] == n else e["src"]
                     if other not in nodes:
@@ -2474,7 +2561,8 @@ class Memory:
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e), "models": [], "model": model}
 
     def consolidate(self, dry_run: bool = True, llm: bool = False, limit: int = 400,
-                    kinds: Sequence[str] = ("fact", "decision", "preference", "note", "insight")) -> List[Dict[str, Any]]:
+                    kinds: Sequence[str] = ("fact", "decision", "preference", "note", "insight"),
+                    incremental: bool = True) -> List[Dict[str, Any]]:
         """Find duplicate / conflicting memories; optionally merge or retire them.
 
         Duplicates (cos >= dup_sim) are auto-retired into the newer row.
@@ -2482,14 +2570,24 @@ class Memory:
         adjudicator decides duplicate/refines/contradicts and the action follows.
         """
         cfg = self.cfg.get("consolidate", {})
+        # 增量水位线：默认只看上次体检之后动过的条目，避免每次把同一批旧条目反复咀嚼
+        watermark = 0
+        if incremental:
+            row = self.db.execute("SELECT v FROM meta WHERE k='consolidate_at'").fetchone()
+            watermark = int(row["v"]) if row else 0
         dup_sim = float(cfg.get("dup_sim", 0.94))
         conf_sim = float(cfg.get("conflict_sim", 0.80))
         # 默认只合并文本、绝不自动 retire：512 维余弦 + simhash 预筛会把
         # "模板相同、载荷不同"的真实记忆判成重复（审计实测 60 条误删 56 条）。
         auto_retire = bool(cfg.get("auto_retire", False))
         rows = [dict(r) for r in self.db.execute(
-            "SELECT * FROM memories WHERE status='active' AND kind IN (%s) "
-            "ORDER BY updated_at DESC LIMIT ?" % ",".join("?" * len(kinds)), tuple(kinds) + (limit,))]
+            "SELECT * FROM memories WHERE status='active' AND kind IN (%s) AND updated_at>=? "
+            "ORDER BY updated_at DESC LIMIT ?" % ",".join("?" * len(kinds)),
+            tuple(kinds) + (watermark, limit))]
+        if incremental and not dry_run:
+            with self.db:
+                self.db.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('consolidate_at',?)",
+                                (str(now()),))
         if not rows:
             return []
         vecs = {r["memory_id"]: r["v"] for r in self.db.execute(

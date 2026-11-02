@@ -376,6 +376,64 @@ class TestTitlePurity(Base):
         self.assertTrue(self.m.search("短标题内容"))
 
 
+class TestBiTemporalLinks(Base):
+    """边也有有效期：同一个"被取代的目标"只留一个现行取代者，旧边失效但不删。"""
+
+    def test_links_get_temporal_columns(self):
+        a = self.m.add("旧结论", title="旧", kind="decision")["id"]
+        b = self.m.add("新结论", title="新", kind="decision")["id"]
+        self.m.link(a, b, "supersedes", valid_at=1000)
+        row = dict(self.m.db.execute(
+            "SELECT * FROM links WHERE src=? AND dst=? AND rel='supersedes'", (a, b)).fetchone())
+        self.assertEqual(row["valid_at"], 1000)
+        self.assertEqual(row["invalid_at"], 0)
+
+    def test_newer_fact_invalidates_older_edge(self):
+        tgt = self.m.add("被取代的旧结论", title="目标", kind="decision")["id"]
+        a = self.m.add("A 取代它", title="A", kind="decision")["id"]
+        c = self.m.add("C 也取代它", title="C", kind="decision")["id"]
+        self.m.link(a, tgt, "supersedes", valid_at=1000)
+        self.m.link(c, tgt, "supersedes", valid_at=2000)
+        old = dict(self.m.db.execute(
+            "SELECT * FROM links WHERE src=? AND dst=? AND rel='supersedes'", (a, tgt)).fetchone())
+        new = dict(self.m.db.execute(
+            "SELECT * FROM links WHERE src=? AND dst=? AND rel='supersedes'", (c, tgt)).fetchone())
+        self.assertEqual(old["invalid_at"], 2000)   # 锚定新事实的 valid_at，不是 now()
+        self.assertEqual(new["invalid_at"], 0)
+
+    def test_related_edges_never_invalidate(self):
+        a = self.m.add("甲", title="甲", kind="note")["id"]
+        b = self.m.add("乙", title="乙", kind="note")["id"]
+        self.m.link(a, b, "related", valid_at=1000)
+        self.m.link(a, b, "related", valid_at=2000)
+        rows = [dict(r) for r in self.m.db.execute(
+            "SELECT * FROM links WHERE src=? AND dst=? AND rel='related'", (a, b))]
+        self.assertTrue(rows)
+        self.assertTrue(all(r["invalid_at"] == 0 for r in rows))
+
+    def test_graph_as_of_filters_edges(self):
+        tgt = self.m.add("目标", title="目标", kind="fact")["id"]
+        a = self.m.add("A", title="A", kind="fact")["id"]
+        c = self.m.add("C", title="C", kind="fact")["id"]
+        self.m.link(a, tgt, "supersedes", valid_at=1000)
+        self.m.link(c, tgt, "supersedes", valid_at=2000)
+        def sources(at):
+            return [e["src"] for e in self.m.graph(tgt, 1, as_of=at)["edges"] if e["dst"] == tgt]
+        self.assertIn(a, sources(1500))
+        self.assertNotIn(c, sources(1500))
+        self.assertIn(c, sources(2500))
+
+    def test_history_as_of_picks_the_version(self):
+        base = int(time.time())
+        old_mid = self.m.add("旧口径：端口 8080", title="端口", kind="fact")["id"]
+        new_mid = self.m.add("新口径：端口 9090", title="端口", kind="fact")["id"]
+        self.m.retire(old_mid, by=new_mid, at=base + 5000)
+        h = self.m.history(new_mid, as_of=base + 4000)
+        self.assertEqual(h["at"]["id"], old_mid)
+        h2 = self.m.history(new_mid, as_of=base + 6000)
+        self.assertEqual(h2["at"]["id"], new_mid)
+
+
 class TestSummaryDemotion(Base):
     """派生摘要（会话回顾）包含全部关键词，不折价就会压过一手条目。"""
 
