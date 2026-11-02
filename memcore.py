@@ -38,7 +38,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # constants / config
 # --------------------------------------------------------------------------
 
-__version__ = "1.2.0"
+__version__ = "0.2.0"
 
 DEFAULT_HOME = os.path.expanduser("~/.dsh/memory")
 VECTOR_DIM = 512

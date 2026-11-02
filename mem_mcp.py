@@ -225,7 +225,7 @@ def main() -> int:
             _write({"jsonrpc": "2.0", "id": mid, "result": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "memcore", "version": "1.0.0"}}})
+                "serverInfo": {"name": "memcore", "version": "0.2.0"}}})
         elif method in ("tools/list", "tools/list_request"):
             _write({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}})
         elif method == "tools/call":

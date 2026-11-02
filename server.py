@@ -143,7 +143,7 @@ def serve(mem, port: int = 8787, open_browser: bool = False) -> None:
         return out
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "memcore/1.1"
+        server_version = "memcore/0.2"
         sys_version = ""
         timeout = SOCKET_TIMEOUT
 
