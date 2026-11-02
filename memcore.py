@@ -81,6 +81,20 @@ DEFAULT_CONFIG = {
         # 派生摘要的排序折价（1.0 = 不折价）。会话回顾包含全部关键词，
         # 不折价时它会把一手条目全压下去。
         "derived": 0.90,
+        # 查询串整串出现在标题/正文：这是最硬的证据，此前只用于"触发唤醒"判定，
+        # 没进排序 —— 于是"agro.mjs 里有哪些导出"这类精确问法会被长正文条目挤下去。
+        "phrase": 0.0,   # 实测无收益（老评测还掉 1 条），默认关
+        # 标题覆盖率：查询的实词有多少落在标题里（等价"标题单独一个字段"的 BM25F）
+        "title_cov": 0.0,   # 与 title_pure 同类但按查询长度归一，实测无收益
+        # 标题纯度：查询词覆盖标题的比例（短标题整条命中 > 长消息顺带提到）
+        "title_pure": 0.08,
+        # 派生摘要的相关性折价（打在 sim_part 上，不是打在总分上）
+        "derived_lex": 1.0,   # 打在 sim_part 上的摘要折价：实测比总折扣更差，默认关
+        # 图通道：沿 links 做一次 Personalized PageRank，把"与命中项相连"的记忆捞上来
+        # （0 = 关闭；调这个值前先跑 tests_eval_hard.py）
+        "ppr": 0.0,   # 实测在硬评测上反而更差，默认关；留开关做实验
+        # 时间问句：查询里出现"最早/第一次"就反过来奖励旧记忆，出现"最近/后来"奖励新记忆
+        "time_intent": 0.0,   # 两版实现（recency 标量 / 时间序）都没测出收益，默认关
     },
     # 检索空结果时是否回落（只在"该有答案"的通道上开：recall 开，preflight 永不开）
     "recall": {"fallback": True, "fallback_n": 6},
@@ -222,6 +236,26 @@ def extract_entities(title: str, tags: Sequence[str] = (), limit: int = 14) -> L
         if len(e) >= 2 and e not in seen:
             seen.append(e)
     return seen[: max(1, int(limit))]
+
+
+_EARLY_RE = re.compile(r"最早|第一次|头一次|最初|当初|上次|那晚|那天|以前|之前(?!问)|更早")
+_LATE_RE = re.compile(r"最近|最新|刚才|刚刚|后来|最后|昨天|今天|这两天|当前")
+
+
+def time_intent(query: str) -> str:
+    """查询里的时间方向：early(找最早) / late(找最近) / ''(无明确方向)。
+
+    "最早那次"和"最近一次"在检索里方向相反，而 recency 只是一项恒定的小权重 ——
+    不显式识别，等于对这两种问法给出同一个排序。
+    """
+    q = query or ""
+    e = bool(_EARLY_RE.search(q))
+    l = bool(_LATE_RE.search(q))
+    if e and not l:
+        return "early"
+    if l and not e:
+        return "late"
+    return ""
 
 
 def safe_base_url(base: str) -> bool:
@@ -1094,6 +1128,50 @@ class Memory:
             act = min(act, max(0.0, dm - 0.02))
         return round(act, 4)
 
+    def _ppr_boost(self, hits: List[Dict[str, Any]], alpha: float = 0.5, iters: int = 8,
+                   lam: float = 0.12, seed_top: int = 30) -> None:
+        """沿 links 做一次 Personalized PageRank，把"和命中项相连"的证据捞上来。
+
+        命中项之间常有依赖关系（决策↔产物↔片段），但打分是各自独立的 ——
+        图通道让一条被强命中选中的记忆，把邻居一起托起来。
+        """
+        ids = [h["id"] for h in hits[:seed_top]]
+        if len(ids) < 2:
+            return
+        want = set(ids)
+        adj: Dict[str, List[Tuple[str, float]]] = {}
+        for chunk in _chunks(ids, 200):
+            marks = ",".join("?" * len(chunk))
+            for r in self.db.execute(
+                    "SELECT src, dst, weight FROM links WHERE src IN (%s) OR dst IN (%s)"
+                    % (marks, marks), list(chunk) + list(chunk)):
+                a, b = r["src"], r["dst"]
+                if a not in want or b not in want:
+                    continue
+                wt = float(r["weight"] or 0.5)
+                adj.setdefault(a, []).append((b, wt))
+                adj.setdefault(b, []).append((a, wt))
+        if not adj:
+            return
+        # 种子分布：按当前分数的相对大小
+        top = max(h["score"] for h in hits[:seed_top]) or 1.0
+        x = {i: max(0.0, hits[k]["score"]) / top for k, i in enumerate(ids)}
+        for _ in range(max(1, int(iters))):
+            nxt = {i: (1.0 - alpha) * x.get(i, 0.0) for i in ids}
+            for i in ids:
+                nb = adj.get(i) or []
+                total = sum(wt for _, wt in nb) or 1.0
+                for j, wt in nb:
+                    if j in nxt:
+                        nxt[j] += alpha * x.get(i, 0.0) * (wt / total)
+            x = nxt
+        peak = max(x.values()) or 1.0
+        peak_s = max(h["score"] for h in hits)
+        for h in hits:
+            ppr = x.get(h["id"], 0.0) / peak
+            h["ppr"] = round(ppr, 3)
+            h["score"] = round((1.0 - lam) * h["score"] + lam * ppr * peak_s, 4)
+
     def _next_state_in_days(self, row: Dict[str, Any], act: float,
                             t: Optional[int] = None) -> Optional[float]:
         """按纯时间衰减推算：还要几天掉到下一档。None = 已经到底 / 被钉住。"""
@@ -1598,7 +1676,34 @@ class Memory:
         # 雷区是"关于记忆的记忆"，不该跟业务记忆抢普通召回的席位：
         # 只有查询本身在问坑/雷区/教训时才带出来（preflight 走自己的通道）
         pit_hint = bool(re.search(r"坑|雷区|教训|pitfall|preflight|踩过", q, re.I))
+        global_time_intent = time_intent(q)
+        time_pos: Dict[str, float] = {}
+        if global_time_intent:
+            ordered = sorted(rows.items(), key=lambda kv: (int(kv[1]["created_at"]),
+                                                           int(kv[1]["updated_at"])))
+            span = max(1, len(ordered) - 1)
+            for idx, (mid_, _row) in enumerate(ordered):
+                time_pos[mid_] = idx / span        # 0 = 库里最早，1 = 最新
         ql = (q or "").lower()
+        q_tokens = set(g for g in _grams(q) if len(g) >= 2)
+        for tk in WORD_RE.findall(ql):
+            if len(tk) >= 2:
+                q_tokens.add(tk)
+        tok_cache: Dict[str, set] = {}
+
+        def title_tokens(row: Dict[str, Any]) -> set:
+            tid = row.get("id") or ""
+            got = tok_cache.get(tid)
+            if got is not None:
+                return got
+            t = (row.get("title") or "").lower()
+            got = set(g for g in _grams(t) if len(g) >= 2)
+            for tk in WORD_RE.findall(t):
+                if len(tk) >= 2:
+                    got.add(tk)
+            tok_cache[tid] = got
+            return got
+
         out = []
         for mid, r in rows.items():
             halflife = KIND_DEFAULTS.get(r["kind"], (0.5, 180.0))[1]
@@ -1606,10 +1711,15 @@ class Memory:
             age_days = max(0.0, (t - anchor) / DAY)
             rec = 0.5 ** (age_days / halflife)
             reinf = min(1.0, math.log1p(int(r["use_count"])) / math.log1p(25))
+            is_sum = self.is_summary(r)
             sim_part = (w["lexical"] * lexn.get(mid, 0.0)
                         + w["semantic"] * max(0.0, sem.get(mid, 0.0))
                         + w.get("overlap", 0.0) * ovl.get(mid, 0.0)
                         + w.get("title", 0.0) * tovl.get(mid, 0.0))
+            if is_sum:
+                # 摘要是靠"把全场词都抄一遍"赢的，所以折扣必须打在相关性上，
+                # 打在总分上等于给 2 倍分的对手打九折，根本翻不过来
+                sim_part *= float(w.get("derived_lex", 0.55))
             if rank_mode == "multiplicative":
                 # 相关性是乘子的一半；另一半交给生命周期激活度（时间×重要度×唤醒）
                 act = self.activation(r, t) if dorm_on else 1.0
@@ -1622,15 +1732,6 @@ class Memory:
                      + (w["pinned"] if r["pinned"] else 0.0))
             if not pit_hint and PITFALL_TAG in (r["tags"] or ""):
                 continue
-            if self.is_summary(r):
-                s *= float(w.get("derived", 0.85))
-            # 标签与实体是两条独立通道，各有权重（不再是同一个 0.05 常数）
-            s += (w.get("tag", 0.05) * cand[mid].get("tag", 0.0)
-                  + w.get("entity", 0.12) * cand[mid].get("ent", 0.0))
-            if project and r["project"] == project:
-                s += 0.06
-            if intent_file and r["kind"] in ("artifact", "project"):
-                s += 0.10
             tl = (r["title"] or "").lower()
             bl = (r["body"] or "").lower()
             # 正文里精确出现算 0.50：够叫醒"沉睡"，不够叫醒"深度沉睡"（0.55 门槛）
@@ -1647,7 +1748,32 @@ class Memory:
                         or bool(cues))              # 触发词命中：本来就是"这条记忆的钥匙"
             if not evidence:
                 continue
-
+            if global_time_intent and float(w.get("time_intent", 0.0)) > 0:
+                # "最早那次"该奖励旧记忆、"最近"该奖励新记忆。
+                # 用**时间序**而不是 recency 标量：库里记忆常常只差几小时，
+                # rec 都在 0.95 以上，(1-rec) 的差不到 0.01，等于没生效。
+                w_t = float(w.get("time_intent", 0.0))
+                s += w_t * ((1.0 - time_pos.get(mid, 0.5))
+                            if global_time_intent == "early" else time_pos.get(mid, 0.5))
+            if float(w.get("title_cov", 0.0)) > 0 and q_tokens:
+                cov = len(q_tokens & title_tokens(r)) / len(q_tokens)
+                s += float(w.get("title_cov", 0.0)) * cov
+            if float(w.get("title_pure", 0.0)) > 0 and q_tokens:
+                # 标题"被查询覆盖的比例"：短标题整条都是答案 > 长聊天记录里顺带提到同样的词
+                tt = title_tokens(r)
+                if tt:
+                    s += float(w.get("title_pure", 0.0)) * (len(q_tokens & tt) / len(tt))
+            if contain > 0 and float(w.get("phrase", 0.0)) > 0:
+                s += float(w.get("phrase", 0.0)) * (contain / 0.80)   # 标题命中=1.0，正文命中≈0.63
+            if self.is_summary(r):
+                s *= float(w.get("derived", 0.9))
+            # 标签与实体是两条独立通道，各有权重（不再是同一个 0.05 常数）
+            s += (w.get("tag", 0.05) * cand[mid].get("tag", 0.0)
+                  + w.get("entity", 0.12) * cand[mid].get("ent", 0.0))
+            if project and r["project"] == project:
+                s += 0.06
+            if intent_file and r["kind"] in ("artifact", "project"):
+                s += 0.10
             # ---- 生命周期：沉睡的记忆不是不存在，是"线索不够就叫不醒" ----
             st = self.memory_state(r, t) if dorm_on else {
                 "state": "awake", "state_label": STATE_LABELS["awake"], "activation": 1.0,
@@ -1695,6 +1821,9 @@ class Memory:
                 "triggers": self.memory_triggers(r),
             })
         out.sort(key=lambda x: x["score"], reverse=True)
+        ppr_w = float(w.get("ppr", 0.0))
+        if ppr_w > 0 and len(out) > 3:
+            self._ppr_boost(out, alpha=0.5, iters=8, lam=ppr_w)
         # MMR diversification on 64-bit simhash (hamming ~ cosine, ~50x cheaper)
         sel: List[Dict[str, Any]] = []
         pool = out[: max(limit * 3, 30)]

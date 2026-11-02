@@ -358,6 +358,24 @@ class TestPointEdit(Base):
         self.assertTrue(self.m.replace_in_body(mid, "端口 8080", "9090", replace_all=True)["ok"])
 
 
+class TestTitlePurity(Base):
+    """短标题整条命中 > 长聊天记录里顺带提到同样的词。"""
+
+    def test_short_title_beats_chatty_one(self):
+        inside = self.m.add("产物 agro.mjs 相关说明",
+                            title="产物 agro.mjs", kind="artifact")["id"]
+        chatter = self.m.add("Team message：agro.mjs 完成，另外还有一堆别的事情要处理，" * 6,
+                             title="Team message from agro-geom", kind="episode")["id"]
+        self.assertIn(inside, [h["id"] for h in self.m.search("agro.mjs 里有哪些导出")][:2])
+        self.assertIn(chatter, [h["id"] for h in self.m.search("agro.mjs 里有哪些导出")])
+
+    def test_title_purity_is_configurable(self):
+        self.m.add("短标题内容", title="短标题", kind="note")
+        self.assertTrue(self.m.search("短标题内容"))
+        self.m.cfg["weights"]["title_pure"] = 0.0
+        self.assertTrue(self.m.search("短标题内容"))
+
+
 class TestSummaryDemotion(Base):
     """派生摘要（会话回顾）包含全部关键词，不折价就会压过一手条目。"""
 
