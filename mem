@@ -156,6 +156,7 @@ def main(argv=None) -> int:
     p.add_argument("--limit", type=int, default=4000)
 
     p = sub.add_parser("consolidate", parents=[common], help="find/merge duplicate & conflicting memories")
+    p.add_argument("--full", action="store_true", help="全量体检（默认只查上次体检之后变过的条目）")
     p.add_argument("--retire", action="store_true",
                    help="with --apply, also close the older entry's validity window "
                         "(default: merge text only, never retire)")
@@ -393,7 +394,8 @@ def main(argv=None) -> int:
         if args.cmd == "consolidate":
             if args.retire:
                 m.cfg.setdefault("consolidate", {})["auto_retire"] = True
-            rep = m.consolidate(dry_run=not args.apply, llm=args.llm, limit=args.limit)
+            rep = m.consolidate(dry_run=not args.apply, llm=args.llm, limit=args.limit,
+                                incremental=not args.full)
             if args.json:
                 dump(rep)
             else:
