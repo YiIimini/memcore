@@ -78,6 +78,9 @@ DEFAULT_CONFIG = {
         # 等于给任何信号都稀释成噪声 —— 实体表因此一直是死表也没人发现）
         "tag": 0.05,
         "entity": 0.12,
+        # 派生摘要的排序折价（1.0 = 不折价）。会话回顾包含全部关键词，
+        # 不折价时它会把一手条目全压下去。
+        "derived": 0.90,
     },
     # 检索空结果时是否回落（只在"该有答案"的通道上开：recall 开，preflight 永不开）
     "recall": {"fallback": True, "fallback_n": 6},
@@ -1151,6 +1154,17 @@ class Memory:
         }
 
     @staticmethod
+    def is_summary(row: Dict[str, Any]) -> bool:
+        """派生摘要（会话回顾这类）不是一手事实，排序时要让位给它的来源条目。
+
+        它们天生**包含所有关键词**（把整场对话的意图抄了一遍），在纯词法排序里
+        必然压过原始条目 —— 评测集里最稳定的错误模式就是这个。
+        """
+        tags = (row.get("tags") or "")
+        title = row.get("title") or ""
+        return ("session-summary" in tags) or title.startswith("会话回顾")
+
+    @staticmethod
     def memory_triggers(row: Dict[str, Any]) -> List[str]:
         """显式触发词：写在 meta.triggers 里，命中即唤醒（不受弱线索门槛限制）。"""
         raw = row.get("meta")
@@ -1557,15 +1571,22 @@ class Memory:
         # sigmoid 是绝对刻度：raw≈阈值 → 0.5，与同批有几条候选无关。
         # 参数按查询词数取（Mem0 scoring.py 同一思路）：短查询更容易是精确查询，阈值低一点。
         lex_raw = {mid: -float(cand[mid].get("bm25", 0.0)) for mid in rows}
-        # 查询越短越可能是精确查询：阈值放低；长句里关键词被稀释，阈值抬高
-        qlen = len(q or "")
-        if qlen <= 6:
-            m0, k = 5.0, 0.7
-        elif qlen <= 16:
-            m0, k = 9.0, 0.6
+        norm_mode = str(w.get("norm") or "sigmoid")
+        if norm_mode == "minmax":
+            # 老公式，留着做 A/B：依赖候选集，单条候选时恒等于 1.0
+            lo = min(lex_raw.values(), default=0.0)
+            hi = max(lex_raw.values(), default=0.0)
+            lexn = {m: ((lex_raw[m] - lo) / (hi - lo) if hi > lo else 0.0) for m in lex_raw}
         else:
-            m0, k = 12.0, 0.5
-        lexn = {m: 1.0 / (1.0 + math.exp(-k * (lex_raw[m] - m0))) for m in lex_raw}
+          # 查询越短越可能是精确查询：阈值放低；长句里关键词被稀释，阈值抬高
+          qlen = len(q or "")
+          if qlen <= 6:
+              m0, k = 5.0, 0.7
+          elif qlen <= 16:
+              m0, k = 9.0, 0.6
+          else:
+              m0, k = 12.0, 0.5
+          lexn = {m: 1.0 / (1.0 + math.exp(-k * (lex_raw[m] - m0))) for m in lex_raw}
 
         intent_file = bool(re.search(r"(文件|文档|路径|目录|哪份|哪篇|file|doc|path|directory)", q, re.I))
         t = now()
@@ -1601,6 +1622,8 @@ class Memory:
                      + (w["pinned"] if r["pinned"] else 0.0))
             if not pit_hint and PITFALL_TAG in (r["tags"] or ""):
                 continue
+            if self.is_summary(r):
+                s *= float(w.get("derived", 0.85))
             # 标签与实体是两条独立通道，各有权重（不再是同一个 0.05 常数）
             s += (w.get("tag", 0.05) * cand[mid].get("tag", 0.0)
                   + w.get("entity", 0.12) * cand[mid].get("ent", 0.0))

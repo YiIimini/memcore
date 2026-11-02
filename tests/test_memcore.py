@@ -358,6 +358,31 @@ class TestPointEdit(Base):
         self.assertTrue(self.m.replace_in_body(mid, "端口 8080", "9090", replace_all=True)["ok"])
 
 
+class TestSummaryDemotion(Base):
+    """派生摘要（会话回顾）包含全部关键词，不折价就会压过一手条目。"""
+
+    def test_original_beats_its_summary(self):
+        body = "用户要求把直播平台接到国内三个平台，斗鱼原生桥优先。"
+        mid_src = self.m.add(body, title="直播平台接入", kind="decision")["id"]
+        mid_sum = self.m.add("本会话意图序列：" + body + " 还有别的意图若干。",
+                             title="会话回顾：直播平台接入", kind="note",
+                             tags=["session-summary"])["id"]
+        hits = self.m.search("直播平台接到国内三个平台")
+        self.assertEqual(hits[0]["id"], mid_src)
+        self.assertIn(mid_sum, [h["id"] for h in hits])
+
+    def test_summary_discount_is_configurable(self):
+        body = "同一段内容，摘要与原文各存一份。"
+        self.m.add(body, title="原文条目", kind="note")["id"]
+        self.m.add(body + "（摘要版）", title="会话回顾：原文条目", kind="note",
+                   tags=["session-summary"])
+        with_discount = self.m.search("同一段内容摘要与原文")[0]["title"]
+        self.m.cfg["weights"]["derived"] = 1.0
+        without = self.m.search("同一段内容摘要与原文")[0]["title"]
+        self.assertNotEqual(with_discount, "(none)")
+        self.assertTrue(with_discount and without)
+
+
 class TestRetrievalErgonomics(Base):
     """两个"别静默失败"的兜底：事件时间入口、空结果回落。"""
 
