@@ -232,6 +232,17 @@ $M search "推流参数" --json       # 每条结果带 state / state_label / ac
 
 配置都在 `config.json` 的 `dormancy` 段（阈值、权重、保质期、冷却、雾化比例），改完重启面板生效。
 
+## 4.55 调研笔记：别人怎么做的
+
+`docs/research/` 是一份 9 个记忆系统的源码级拆解（Mem0、Letta、Zep/Graphiti、Cognee、A-MEM、HippoRAG、
+LangMem、Memobase、MemOS），每条建议都落到本仓库的函数与行号上，并标注工作量与风险。
+
+- 汇总与路线图：[docs/research/00-synthesis.md](docs/research/00-synthesis.md)
+- 结论摘要：能抄的不是"更聪明的抽取"，而是**实体通道、时间轴、写入契约、后台整理状态机**四处工程细节；
+  业界最响的"LLM 判 ADD/UPDATE/DELETE"已被 Mem0 自己砍掉（2026 版退成 ADD-only），追它是追过时方向。
+- 顺带实测出两件事：`entities` 表是死表（0 行、全仓无 INSERT），加成系数硬编码 0.05 让任何实体信号
+  都被稀释成噪声；12 条评测集已饱和，排序类改动测不出差异 —— 排序优化之前先扩评测集。
+
 ## 4.6 记忆怎么才能真正帮上忙（闭环）
 
 记忆库最大的失败模式不是"存不下"，是**存了但没被想起来**。所以本仓库把检索钉在四个必然发生的时点上：

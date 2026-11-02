@@ -332,6 +332,26 @@ class TestPreflight(Base):
         self.assertEqual(items[0]["id"], pit)
         self.assertLessEqual(len([i for i in items if not i["pitfall"]]), 3)
 
+    def test_pitfall_stays_out_of_normal_recall(self):
+        """雷区是"关于记忆的记忆"：普通召回不该被它挤掉，问坑时才带出来。"""
+        pit = self._learn("memcore.py", "直播方案踩过的坑", "现象：占位", "修法：占位")
+        biz = self.m.add("直播宠物方案写在 dsh-pet-AI直播实现方案.md",
+                         title="直播宠物方案", kind="artifact")["id"]
+        normal = [h["id"] for h in self.m.search("直播方案写到哪")]
+        self.assertNotIn(pit, normal)
+        self.assertIn(biz, normal)
+        asked = [h["id"] for h in self.m.search("直播这块踩过什么坑")]
+        self.assertIn(pit, asked)
+
+    def test_rank_mode_switch(self):
+        self.m.add("粒子特效走离屏辉光", title="粒子特效", kind="decision")
+        self.m.cfg["weights"]["mode"] = "multiplicative"
+        hits = self.m.search("粒子特效")
+        self.assertTrue(hits)
+        self.assertTrue(all(isinstance(h["score"], float) for h in hits))
+        self.m.cfg["weights"]["mode"] = "additive"
+        self.assertTrue(self.m.search("粒子特效"))
+
     def test_brief_surfaces_pitfall_count(self):
         self._learn("memcore.py", "随便一个坑", "现象", "修法")
         self.assertIn("已知雷区", self.m.brief(budget_tokens=900))

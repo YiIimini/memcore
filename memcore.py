@@ -63,6 +63,9 @@ KINDS = tuple(KIND_DEFAULTS)
 DEFAULT_CONFIG = {
     "version": 6,
     "weights": {          # validated on the real store (12/12 paraphrase queries)
+        # additive：老公式，相关性/时效/显著度线性相加（用近期性替代相关性）
+        # multiplicative：LangMem 口径 —— 相关性 ×（重要度·强度），由生命周期激活度承担后半段
+        "mode": "additive",
         "lexical": 0.50,
         "semantic": 0.22,
         "overlap": 0.12,
@@ -1455,6 +1458,10 @@ class Memory:
         dorm_on = bool(dorm.get("enabled", True))
         trig_cfg = dorm.get("trigger") or {}
         wake_on_search = bool(dorm.get("wake_on_search", True))
+        rank_mode = str(w.get("mode") or "additive")
+        # 雷区是"关于记忆的记忆"，不该跟业务记忆抢普通召回的席位：
+        # 只有查询本身在问坑/雷区/教训时才带出来（preflight 走自己的通道）
+        pit_hint = bool(re.search(r"坑|雷区|教训|pitfall|preflight|踩过", q, re.I))
         ql = (q or "").lower()
         out = []
         for mid, r in rows.items():
@@ -1463,14 +1470,22 @@ class Memory:
             age_days = max(0.0, (t - anchor) / DAY)
             rec = 0.5 ** (age_days / halflife)
             reinf = min(1.0, math.log1p(int(r["use_count"])) / math.log1p(25))
-            s = (w["lexical"] * lexn.get(mid, 0.0)
-                 + w["semantic"] * max(0.0, sem.get(mid, 0.0))
-                 + w.get("overlap", 0.0) * ovl.get(mid, 0.0)
-                 + w.get("title", 0.0) * tovl.get(mid, 0.0)
-                 + w["recency"] * rec
-                 + w["salience"] * float(r["salience"])
-                 + w["reinforce"] * reinf
-                 + (w["pinned"] if r["pinned"] else 0.0))
+            sim_part = (w["lexical"] * lexn.get(mid, 0.0)
+                        + w["semantic"] * max(0.0, sem.get(mid, 0.0))
+                        + w.get("overlap", 0.0) * ovl.get(mid, 0.0)
+                        + w.get("title", 0.0) * tovl.get(mid, 0.0))
+            if rank_mode == "multiplicative":
+                # 相关性是乘子的一半；另一半交给生命周期激活度（时间×重要度×唤醒）
+                act = self.activation(r, t) if dorm_on else 1.0
+                s = sim_part * (0.55 + 0.45 * act)
+            else:
+                s = (sim_part
+                     + w["recency"] * rec
+                     + w["salience"] * float(r["salience"])
+                     + w["reinforce"] * reinf
+                     + (w["pinned"] if r["pinned"] else 0.0))
+            if not pit_hint and PITFALL_TAG in (r["tags"] or ""):
+                continue
             # tag/entity bonus
             s += 0.05 * (cand[mid].get("tag", 0.0) + cand[mid].get("ent", 0.0))
             if project and r["project"] == project:
